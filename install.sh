@@ -285,7 +285,25 @@ iptables -t nat -A POSTROUTING -s ${SUBNET_V4}.0/24 -o "$IFACE" -j MASQUERADE 2>
 ip6tables -t nat -A POSTROUTING -s fdaa:bd4c:1234::/64 -o "$IFACE" -j MASQUERADE 2>/dev/null || true
 netfilter-persistent save 2>/dev/null || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 
-systemctl enable --now wg-quick@wg0 >/dev/null 2>&1 || systemctl restart wg-quick@wg0
+systemctl reset-failed wg-quick@wg0.service >/dev/null 2>&1 || true
+systemctl enable --now wg-quick@wg0 >/dev/null 2>&1 || systemctl restart wg-quick@wg0 >/dev/null 2>&1 || true
+
+# If systemd unit still cannot bring wg0 up (broken unit / failed state),
+# start the interface directly with ip+wg — the panel watchdog will keep it alive.
+if ! ip -o link show wg0 >/dev/null 2>&1; then
+  say "wg-quick не поднял wg0 — включаю интерфейс напрямую..."
+  wg-quick down wg0 >/dev/null 2>&1 || true
+  ip link add wg0 type wireguard 2>/dev/null || true
+  # apply the FULL rendered config (port, noise key, peers) if possible
+  if wg set-conf wg0 /etc/wireguard/wg0.conf >/dev/null 2>&1; then
+    :
+  else
+    wg set wg0 private-key <(cat /etc/amnezia-panel/server_private.key) listen-port "$WG_PORT" 2>/dev/null || true
+  fi
+  ip addr add ${SERVER_V4}/24 dev wg0 2>/dev/null || true
+  ip -6 addr add fdaa:bd4c:1234::1/64 dev wg0 2>/dev/null || true
+  ip link set wg0 up 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------- 7. firewall
 # UFW намеренно НЕ настраивается и НЕ включается этим установщиком:
@@ -396,7 +414,7 @@ fi
 # панель должна отвечать ещё до выпуска сертификата — иначе certbot увидит 502,
 # а пользователь получит «голый nginx». Поднимаем её прямо сейчас.
 ensure_panel_up() {
-  systemctl is-active --quiet wg-quick@wg0 || systemctl restart wg-quick@wg0 || true
+  systemctl is-active --quiet wg-quick@wg0 || { systemctl reset-failed wg-quick@wg0.service >/dev/null 2>&1 || true; systemctl restart wg-quick@wg0 >/dev/null 2>&1 || true; }
   systemctl restart amnezia-panel || true
   local i
   for i in $(seq 1 10); do

@@ -13,6 +13,22 @@ from db import conn, get_setting, set_setting
 CONF = "/etc/amnezia-panel/wg.conf"
 
 
+def _detect_default_iface():
+    """Best-effort detection of the primary outbound interface (eth0 etc.)."""
+    try:
+        r = subprocess.run(["ip", "-4", "route", "show", "default"],
+                           capture_output=True, text=True, timeout=10)
+        m = re.search(r"\bdev\s+(\S+)", r.stdout or "")
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    for cand in ("eth0", "ens3", "enp3s0"):
+        if os.path.exists("/sys/class/net/" + cand):
+            return cand
+    return "eth0"
+
+
 def gen_privkey():
     return base64.b64encode(secrets.token_bytes(32)).decode()
 
@@ -181,45 +197,89 @@ def render_conf():
 def _direct_up():
     """Bring wg0 up without wg-quick (fallback when systemd units are broken).
 
-    Mirrors what install.sh does: create interface, set address/up, and add a
-    masquerade rule for the tunnel subnet.
+    Creates the wireguard link, applies the full rendered config (listen port,
+    noise/preshared keys, all peers) via `wg set-conf`, then adds addresses
+    and brings the interface up — mirroring what wg-quick would do.
     """
-    import ipaddress as _ipa
     iface = "wg0"
-    server_ip = get_setting("server_ip", "") or ""
+    server_ip = get_setting("server_ip", "") or "10.66.66.1/24"
+    v6 = get_setting("server_ipv6") or ""
+    if v6 and not v6.split(":")[0].lower().startswith(("fd", "fc")):
+        v6 = ""  # only ULA (fd00::/8) addresses are safe for the tunnel
     conf = render_conf()
-    key_m = re.search(r"^PrivateKey\s*=\s*(\S+)", conf, re.M)
-    if not key_m:
-        return False, "no PrivateKey in rendered config"
-    priv = key_m.group(1)
-    cmds = [
-        ["ip", "link", "del", iface],          # ignore failure if absent
-        ["ip", "tuntap", "add", "dev", iface, "mode", "wireguard"],
-        ["wg", "set-key", iface, "private-key", "-"],
-        ["ip", "addr", "add", server_ip or "10.66.66.1/24", "dev", iface],
-        ["ip", "link", "set", iface, "up"],
-    ]
-    err = ""
-    for c in cmds:
-        try:
-            r = subprocess.run(c, capture_output=True, text=True,
-                               input=priv if c[1] == "set-key" else None)
-        except FileNotFoundError:
-            return False, "%s не найден" % c[0]
-        if r.returncode != 0 and c[:3] != ["ip", "link", "del"]:
-            err = (r.stderr or r.stdout).strip()
+    tmp = "/tmp/wg0-direct.conf"
     try:
-        net = _ipa.ip_network(server_ip.split("/")[0] + ("/%d" % (int((server_ip.split("/")[1]) if "/" in server_ip else 24))), strict=False) if "/" in server_ip else _ipa.ip_network(get_setting("subnet", "10.66.66.0/24"), strict=False)
-        subprocess.run(["iptables", "-t", "nat", "-A", "POSTROUTING",
-                        "-s", str(net), "-o", "+", "-j", "MASQUERADE"],
-                       capture_output=True)
+        with open(tmp, "w") as f:
+            f.write(conf)
+        os.chmod(tmp, 0o600)
+    except OSError as e:
+        return False, "не удалось записать %s: %s" % (tmp, e)
+
+    def run(cmd, shell=False):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=30, shell=shell)
+        except FileNotFoundError:
+            return None
+        except subprocess.TimeoutExpired:
+            class R:
+                returncode, stderr, stdout = 124, "timeout", ""
+            return R()
+
+    err = ""
+    # recreate the link from scratch (wg set-conf needs a fresh interface)
+    run(["ip", "link", "del", iface])
+    r = run(["ip", "tuntap", "add", "dev", iface, "mode", "wireguard"])
+    if r is None:
+        return False, "утилита ip не найдена"
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip()
+    r = run(["wg", "set-conf", iface, tmp])
+    if r is None:
+        return False, "утилита wg не найдена"
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip()
+    r = run(["ip", "addr", "add", server_ip, "dev", iface])
+    if r is not None and r.returncode != 0:
+        err = err or (r.stderr or r.stdout).strip()
+    if v6:
+        run(["ip", "-6", "addr", "add", v6, "dev", iface])
+    r = run(["ip", "link", "set", iface, "up"])
+    if r is not None and r.returncode != 0:
+        err = err or (r.stderr or r.stdout).strip()
+    # NAT masquerade for the tunnel subnet (idempotent)
+    try:
+        net = server_ip if "/" in server_ip else \
+            get_setting("subnet", "10.66.66.0/24")
+        out = subprocess.run(["iptables", "-t", "nat", "-S", "POSTROUTING"],
+                             capture_output=True, text=True).stdout
+        if ("-s %s " % net) not in out and ("%s " % net) not in out:
+            fwd = get_setting("fwd_interface") or _detect_default_iface()
+            subprocess.run(["iptables", "-t", "nat", "-A", "POSTROUTING",
+                            "-s", net, "!", "-o", fwd, "-j", "MASQUERADE"],
+                           capture_output=True)
     except Exception:
         pass
     try:
-        r = subprocess.run(["wg", "showconf", iface], capture_output=True, text=True)
-    except FileNotFoundError:
-        return False, "утилита wg не найдена"
-    return r.returncode == 0, err or (r.stderr or "")
+        r = run(["wg", "showconf", iface])
+    except Exception:
+        r = None
+    ok = bool(r) and r.returncode == 0
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    return ok, err or ((r.stderr if r else "") or "")
+
+
+def _iface_state():
+    """(interface_exists, is_up) for wg0."""
+    try:
+        r = subprocess.run(["ip", "-o", "link", "show", "wg0"],
+                           capture_output=True, text=True)
+        return r.returncode == 0, "state UP" in (r.stdout or "")
+    except Exception:
+        return False, False
 
 
 def apply_config():
@@ -231,6 +291,39 @@ def apply_config():
         os.chmod(CONF, 0o600)
     except OSError as e:
         return False, "не удалось записать %s: %s" % (CONF, e)
+
+    # If wg0 already exists and is UP, do NOT bounce it via wg-quick — that
+    # drops every established client session.  Just add/update peers live
+    # (`wg set` is additive; unknown keys are simply added).
+    exists, up = _iface_state()
+    if exists and up:
+        n = 0
+        err = ""
+        for m in re.finditer(
+                r"\[Peer\]\n(?:#.*\n)?PublicKey = (\S+)\n"
+                r"PresharedKeyFile = (\S+)\nAllowedIPs = ([^\n]+)", conf):
+            pub, pskfile, aips = m.groups()
+            args = ["wg", "set", "wg0", "peer", pub]
+            if os.path.isfile(pskfile):
+                args += ["preshared-key", pskfile]
+            args += ["allowed-ips", aips.strip()]
+            r = subprocess.run(args, capture_output=True, text=True)
+            if r.returncode == 0:
+                n += 1
+            else:
+                err = (r.stderr or r.stdout or "").strip()[:200]
+        try:
+            iface = get_setting("fwd_interface") or "eth0"
+            subprocess.run(["iptables", "-t", "nat", "-A", "POSTROUTING",
+                            "-s", get_setting("subnet", "10.66.66.0/24"),
+                            "!", "-o", iface, "-j", "MASQUERADE"],
+                           capture_output=True)
+        except Exception:
+            pass
+        msg = ("интерфейс не перезапускался — обновлено живых peer'ов: %d" % n)
+        if err:
+            msg += "; предупреждение: " + err
+        return True, msg
 
     def _wg_quick(args):
         try:

@@ -86,7 +86,10 @@ SETTINGS_KEYS = [
 ]
 
 AUTO_NET_KEYS = ["endpoint_host", "port", "subnet", "server_ip",
-                 "server_ipv6", "default_dns", "default_mtu"]
+                 "default_dns", "default_mtu"]
+# NOTE: server_ipv6 is intentionally NOT auto-detected from the host's public
+# IPv6 — the tunnel needs a ULA address (fd00::/8).  A global v6 would break
+# `wg set-conf` / client configs.  It can still be set manually in Settings.
 
 
 # ---------- automatic network detection (settings are auto-filled from the server) ----------
@@ -368,69 +371,92 @@ def _systemd_set_iface(iface):
 
 
 def _bring_up_directly(conf):
-    """Fallback: bring wg0 up with `ip` + `wg` when wg-quick is unavailable/fails."""
+    """Fallback: bring wg0 up with `ip` + `wg` when wg-quick is unavailable/fails.
+
+    Delegates to wg._direct_up(), which applies the FULL rendered config via
+    `wg set-conf` (listen port, noise/PresharedKeyFile, AmneziaWG parameters,
+    all peers) — a hand-parsed subset dropped those settings and made clients
+    unable to handshake.
+    """
     try:
-        subprocess.run(["ip", "link", "del", "wg0"], capture_output=True, timeout=10)
-        priv = None
-        addr = port = None
-        with open(conf) as f:
-            for line in f:
-                parts = line.split("=", 1)
-                if len(parts) != 2:
-                    continue
-                k, v = parts[0].strip().lower(), parts[1].strip()
-                if k == "privatekey":
-                    priv = v
-                elif k == "address" and addr is None:
-                    addr = v
-                elif k == "listenport":
-                    port = v
-        if not priv or not addr:
-            return False
-        cmds = [
-            ["ip", "link", "add", "wg0", "type", "wireguard",
-             "private-key", priv, "listen-port", port or "443"],
-            ["ip", "addr", "add", addr, "dev", "wg0"],
-            ["ip", "link", "set", "wg0", "up"],
-        ]
-        for c in cmds:
-            r = subprocess.run(c, capture_output=True, timeout=15)
-            if r.returncode != 0:
-                return False
-        # add active peers straight from the rendered config
-        section = None
-        peer = {}
-        with open(conf) as f:
-            lines = f.read().splitlines() + [""]
-        for line in lines:
-            s = line.strip()
-            if s.startswith("["):
-                if section == "peer" and peer.get("publickey"):
-                    args = ["wg", "set", "wg0", "peer", peer["publickey"],
-                            "allowed-ips", peer.get("allowedips", "0.0.0.0/0")]
-                    if peer.get("presharedkeyfile"):
-                        args += ["preshared-key", peer["presharedkeyfile"]]
-                    subprocess.run(args, capture_output=True, timeout=15)
-                section = "interface" if "interface" in s.lower() else \
-                          ("peer" if "peer" in s.lower() else None)
-                peer = {}
-            elif "=" in s and section == "peer":
-                k, v = [x.strip() for x in s.split("=", 1)]
-                peer[k.lower()] = v
-        r = subprocess.run(["wg", "show"], capture_output=True, text=True, timeout=10)
-        return "wg0" in (r.stdout or "")
+        ok, err = wg._direct_up()
+        if not ok:
+            _log("[warn] direct wg0 bring-up failed: %s" % (err or "")[:300])
+        return ok
     except Exception as e:
-        _log("[warn] direct wg0 bring-up failed: %r" % (e,))
+        _log("[warn] direct wg0 bring-up error: %r" % (e,))
         return False
 
 
-def _ensure_wg_interface_up():
-    """Bring wg0 up if it is down (idempotent; safe to call on every start)."""
+def _sync_live_peers(conf_path):
+    """Add peers from the rendered config into the *live* wg0 without taking
+    the interface down.  Clients keep their existing secure sessions, so this
+    is safe to run periodically."""
+    try:
+        with open(conf_path) as f:
+            lines = f.read().splitlines() + [""]
+    except OSError:
+        return
+    section = None
+    peer = {}
+    for line in lines:
+        s = line.strip()
+        if s.startswith("["):
+            if section == "peer" and peer.get("publickey"):
+                args = ["wg", "set", "wg0", "peer", peer["publickey"]]
+                if peer.get("presharedkeyfile") and \
+                        os.path.isfile(peer["presharedkeyfile"]):
+                    args += ["preshared-key", peer["presharedkeyfile"]]
+                args += ["allowed-ips", peer.get("allowedips", "0.0.0.0/0")]
+                try:
+                    subprocess.run(args, capture_output=True, timeout=15)
+                except Exception:
+                    pass
+            section = "interface" if "interface" in s.lower() else \
+                      ("peer" if "peer" in s.lower() else None)
+            peer = {}
+        elif "=" in s and section == "peer":
+            k, v = [x.strip() for x in s.split("=", 1)]
+            peer[k.lower()] = v
+
+
+def _enable_fwd(iface):
+    """Make sure IPv4 forwarding + NAT masquerade are active even if
+    install.sh's sysctl/netfilter setup was interrupted."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward") as f:
+            cur = f.read().strip()
+        if cur != "1":
+            subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"],
+                           capture_output=True, timeout=10)
+    except Exception:
+        pass
+    try:
+        net = db.get_setting("subnet", "10.66.66.0/24")
+        r = subprocess.run(["iptables", "-t", "nat", "-C", "POSTROUTING",
+                            "-s", net, "!", "-o", iface, "-j", "MASQUERADE"],
+                           capture_output=True, timeout=10)
+        if r.returncode != 0:
+            subprocess.run(["iptables", "-t", "nat", "-A", "POSTROUTING",
+                            "-s", net, "!", "-o", iface, "-j", "MASQUERADE"],
+                           capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _ensure_wg_interface_up(force=False):
+    """Bring wg0 up if it is down (idempotent; safe to call repeatedly).
+
+    Also keeps live peers in sync with the panel DB without dropping
+    established client connections."""
     try:
         r = subprocess.run(["ip", "-o", "link", "show", "wg0"],
                            capture_output=True, text=True, timeout=10)
         state = (r.stdout or "")
-        if r.returncode == 0 and "state UP" in state:
+        if r.returncode == 0 and "state UP" in state and not force:
+            # already up — just make sure all active keys are present live
+            _sync_live_peers("/etc/wireguard/wg0.conf")
+            _enable_fwd(detect_default_iface())
             return True
     except Exception:
         pass
@@ -451,6 +477,7 @@ def _ensure_wg_interface_up():
                            capture_output=True, timeout=15)
             subprocess.run(["systemctl", "restart", "wg-quick@wg0.service"],
                            capture_output=True, timeout=30)
+        _enable_fwd(detect_default_iface())
         chk = subprocess.run(["ip", "-o", "link", "show", "wg0"],
                              capture_output=True, text=True, timeout=10)
         return "state UP" in (chk.stdout or "")
@@ -1159,15 +1186,19 @@ def api_ping(self):
     # lightweight health report: helps diagnose 502 / half-installed states
     pub = db.get_setting("server_pubkey") or ""
     wg_up = False
+    peers_live = 0
     try:
-        r = subprocess.run(["wg", "show"], capture_output=True, text=True, timeout=5)
-        wg_up = "wg0" in (r.stdout or "")
+        r = subprocess.run(["wg", "show", "wg0"], capture_output=True,
+                           text=True, timeout=5)
+        wg_up = r.returncode == 0
+        peers_live = (r.stdout or "").count("peer:")
     except Exception:
         pass
     index_ok = os.path.isfile(os.path.join(WEB_ROOT, "index.html"))
     self._send(200, json.dumps({
         "ok": True, "app": "amnezia-panel",
         "wg0": wg_up,
+        "peers_live": peers_live,
         "pubkey_ready": bool(pub),
         "web_root": WEB_ROOT,
         "web_files_ok": index_ok,
@@ -1206,11 +1237,24 @@ ROUTES = [
 
 
 def background_loop():
+    heal_fail = 0
     while True:
         try:
             wg.sync_stats()
         except Exception:
             pass
+        # periodic self-healing: if wg0 went down (crash, reboot, manual
+        # `wg-quick down`), bring it back up; when it is already up this only
+        # syncs live peers with the DB — no client sessions are dropped.
+        try:
+            if _ensure_wg_interface_up():
+                heal_fail = 0
+            else:
+                heal_fail += 1
+                if heal_fail in (3, 10):
+                    _log("[warn] wg0 still down after %d attempts" % heal_fail)
+        except Exception as e:
+            _log("[warn] wg0 watchdog error: %r" % (e,))
         time.sleep(30)
 
 
