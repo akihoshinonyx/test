@@ -34,18 +34,18 @@
 ## 🚀 Установка на VPS (Ubuntu 20.04 / 22.04 / 24.04, Debian 11/12)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install.sh -o install.sh && sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/akihoshinonyx/test/main/install.sh -o install.sh && sudo bash install.sh
 ```
 
-> Замените `OWNER/REPO` на ваш GitHub-репозиторий. Если клонируете руками:
+> Замените `akihoshinonyx/test` на ваш GitHub-репозиторий. Если клонируете руками:
 > ```bash
-> git clone https://github.com/OWNER/REPO.git && cd REPO && sudo bash install.sh
+> git clone https://github.com/akihoshinonyx/test.git && cd REPO && sudo bash install.sh
 > ```
 
 ### Непараметрическая (non-interactive) установка
 ```bash
 DOMAIN=vpn.example.com WG_PORT=443 ADMIN_USER=admin ADMIN_PASS='Свой_пароль' \
-  bash -c "$(curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install.sh)"
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/akihoshinonyx/test/main/install.sh)"
 ```
 *(в таком виде используйте `sudo -E` для передачи переменных окружения)*
 
