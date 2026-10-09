@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AmneziaWG Panel</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
+</head>
+<body>
+<div id="app" class="hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo"><svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M12 2L4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2z" stroke="url(#g)" stroke-width="1.7" fill="rgba(99,102,241,.12)"/><path d="M9 12l2 2 4-4.5" stroke="#34d399" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><defs><linearGradient id="g" x1="4" y1="2" x2="20" y2="21"><stop stop-color="#818cf8"/><stop offset="1" stop-color="#34d399"/></linearGradient></defs></svg></div>
+      <div><b>AmneziaWG</b><span>control panel 3.0</span></div>
+    </div>
+    <nav id="nav"></nav>
+    <div class="sidebar-foot">
+      <button id="themeBtn" class="icon-btn" title="Тема">🌗</button>
+      <div id="whoami" class="whoami"></div>
+      <button id="logoutBtn" class="btn ghost sm">Выйти</button>
+    </div>
+  </aside>
+  <main id="main"></main>
+</div>
+
+<div id="login" class="login-wrap hidden">
+  <div class="login-card">
+    <div class="login-logo"><svg width="44" height="44" viewBox="0 0 24 24" fill="none"><path d="M12 2L4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2z" stroke="url(#g2)" stroke-width="1.6" fill="rgba(99,102,241,.15)"/><path d="M9 12l2 2 4-4.5" stroke="#34d399" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><defs><linearGradient id="g2" x1="4" y1="2" x2="20" y2="21"><stop stop-color="#818cf8"/><stop offset="1" stop-color="#34d399"/></linearGradient></defs></svg></div>
+    <h1>AmneziaWG Panel</h1>
+    <p class="muted">VPN-сервер на базе AmneziaWG 3.0</p>
+    <form id="loginForm">
+      <label>Логин<input name="username" autocomplete="username" required></label>
+      <label>Пароль<input name="password" type="password" autocomplete="current-password" required></label>
+      <div id="loginErr" class="err"></div>
+      <button class="btn primary block" type="submit">Войти</button>
+    </form>
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toastRoot" class="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>
