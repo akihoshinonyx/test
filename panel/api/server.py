@@ -697,7 +697,14 @@ def sanitize_user(u):
 
 
 R = lambda p: re.compile(p)
+
+
+def api_ping(self):
+    self._send(200, json.dumps({"ok": True, "app": "amnezia-panel"}).encode())
+
+
 ROUTES = [
+    (R(r"^/api/ping$"), "GET", api_ping),
     (R(r"^/api/login$"), "POST", Handler.api_login),
     (R(r"^/api/logout$"), "POST", Handler.api_logout),
     (R(r"^/api/me$"), "GET", Handler.api_me),

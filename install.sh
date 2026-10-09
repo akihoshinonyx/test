@@ -117,13 +117,17 @@ elif [[ -d "$SCRIPT_DIR/api" && -d "$SCRIPT_DIR/web" ]]; then
   SRC="$SCRIPT_DIR"
 else
   say "Файлы панели не найдены рядом со скриптом — скачиваю с GitHub..."
-  mkdir -p /tmp/amnezia-panel-src/api /tmp/amnezia-panel-src/web
+  mkdir -p /tmp/amnezia-panel-src/api /tmp/amnezia-panel-src/web /tmp/amnezia-panel-src/scripts
   BASE="https://raw.githubusercontent.com/akihoshinonyx/test/main"
   for f in server.py db.py wg.py; do fetch_src "/tmp/amnezia-panel-src/api/$f" "$BASE/panel/api/$f"; done
   for f in index.html app.js style.css; do fetch_src "/tmp/amnezia-panel-src/web/$f" "$BASE/panel/web/$f"; done
+  for f in nginx.conf.template amnezia-panel.service awg-stats.service awg-stats.timer; do
+    curl -fsSL --max-time 30 "$BASE/panel/scripts/$f" -o "/tmp/amnezia-panel-src/scripts/$f" || true
+  done
   SRC="/tmp/amnezia-panel-src"
 fi
 cp -r "$SRC/api" "$SRC/web" /opt/amnezia-panel/
+[[ -d "$SRC/scripts" ]] && cp -r "$SRC/scripts" /opt/amnezia-panel/ || true
 rm -rf /tmp/amnezia-panel-src
 pip3 install --quiet qrcode pillow 2>/dev/null || pip3 install --break-system-packages --quiet qrcode pillow 2>/dev/null || warn "qrcode/pillow не установлены (QR будет недоступен)."
 
@@ -183,73 +187,182 @@ ufw --force enable >/dev/null
 # fail2ban
 apt-get install -y -qq fail2ban >/dev/null 2>&1 && systemctl enable --now fail2ban >/dev/null 2>&1 || true
 
-# ---------------------------------------------------------------- 8. systemd services
+# ---------------------------------------------------------------- 8. nginx config + TLS (before services start)
+say "Устанавливаем nginx-конфиг и получаем TLS-сертификат..."
+apt-get install -y -qq certbot python3-certbot-nginx >/dev/null 2>&1 || apt-get install -y certbot python3-certbot-nginx || true
+
+NGINX_CONF=/etc/nginx/sites-available/amnezia-panel
+TLS_DIR=/etc/nginx/tls
+CERTDIR=/etc/letsencrypt/live/$DOMAIN
+mkdir -p "$TLS_DIR"
+
+if [[ -f "$SRC/scripts/nginx.conf.template" ]]; then
+  sed "s|__DOMAIN__|$DOMAIN|g" "$SRC/scripts/nginx.conf.template" > "$NGINX_CONF"
+else
+  cat > "$NGINX_CONF" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN;
+
+    ssl_certificate     $TLS_DIR/self-signed.pem;
+    ssl_certificate_key $TLS_DIR/self-signed.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers Mozilla-Intermediate;
+    add_header Strict-Transport-Security "max-age=63072000" always;
+    add_header X-Frame-Options DENY;
+    add_header X-Content-Type-Options nosniff;
+
+    location / {
+        proxy_pass http://127.0.0.1:8777;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+fi
+
+# temporary self-signed cert so nginx starts even if certbot fails later
+if [[ ! -f "$TLS_DIR/self-signed.key" ]]; then
+  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+    -keyout "$TLS_DIR/self-signed.key" -out "$TLS_DIR/self-signed.pem" \
+    -subj "/CN=$DOMAIN" >/dev/null 2>&1
+  chmod 600 "$TLS_DIR/self-signed.key"
+fi
+
+ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/amnezia-panel
+rm -f /etc/nginx/sites-enabled/default
+if nginx -t >/dev/null 2>&1; then
+  systemctl enable nginx >/dev/null 2>&1 || true
+  systemctl restart nginx
+else
+  warn "Проверка nginx завершилась с ошибкой — показываю конфиг:"
+  cat "$NGINX_CONF" >&2
+  nginx -t || true
+  die "Некорректный nginx-конфиг. Исправьте /etc/nginx/sites-available/amnezia-panel и перезапустите установку."
+fi
+
+# issue a real Let's Encrypt certificate (HTTP-01 via webroot — no ALPN needed)
+say "Выпуск сертификата Let's Encrypt для $DOMAIN..."
+mkdir -p /var/www/html
+CERT_OK=0
+if command -v certbot >/dev/null 2>&1; then
+  for _attempt in 1 2; do
+    if certbot certonly --webroot -w /var/www/html -d "$DOMAIN" \
+         --non-interactive --agree-tos -m "admin@$DOMAIN" \
+         --keep-until-expiring --preferred-challenges http >/dev/null 2>&1; then
+      CERT_OK=1; break
+    fi
+    sleep 3
+  done
+fi
+if [[ $CERT_OK == 1 ]]; then
+  say "Сертификат Let's Encrypt выдан успешно ✔"
+  sed -i "s|$TLS_DIR/self-signed.pem|$CERTDIR/fullchain.pem|; s|$TLS_DIR/self-signed.key|$CERTDIR/privkey.pem|" "$NGINX_CONF"
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx
+  else
+    warn "nginx не принял LE-пути к сертификату — оставляю самоподписанный."
+    sed -i "s|$CERTDIR/fullchain.pem|$TLS_DIR/self-signed.pem|; s|$CERTDIR/privkey.pem|$TLS_DIR/self-signed.key|" "$NGINX_CONF"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx
+    CERT_OK=0
+  fi
+else
+  warn "certbot не смог получить сертификат (проверьте A-запись $DOMAIN -> $PUB_IP и доступность портов 80/443 извне)."
+  warn "Панель работает на временном самоподписанном сертификате."
+  warn "После исправления DNS выполните:"
+  echo "  certbot certonly --webroot -w /var/www/html -d $DOMAIN --agree-tos -m admin@$DOMAIN --keep-until-expiring"
+  echo "  # затем замените пути сертификатов в $NGINX_CONF и: systemctl reload nginx"
+fi
+if [[ $CERT_OK == 1 ]] && systemctl enable certbot.timer >/dev/null 2>&1; then
+  :
+else
+  (crontab -l 2>/dev/null | grep -v certbot; \
+   echo "0 3 * * * certbot renew --quiet --deploy-hook 'systemctl reload nginx'") | crontab -
+fi
+
+# ---------------------------------------------------------------- 9. systemd services
 say "Регистрация systemd-сервисов панели..."
-cp "$SRC/scripts/amnezia-panel.service" /etc/systemd/system/ 2>/dev/null || cat > /etc/systemd/system/amnezia-panel.service <<EOF
+cat > /etc/systemd/system/amnezia-panel.service <<EOF
 [Unit]
 Description=AmneziaWG Control Panel
 After=network.target wg-quick@wg0.service
 Wants=wg-quick@wg0.service
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /opt/amnezia-panel/api/server.py
 Restart=always
 RestartSec=3
 Environment=AWG_PORT=8777
+Environment=AWG_DB=/var/lib/amnezia-panel/panel.db
+
 [Install]
 WantedBy=multi-user.target
 EOF
-cp "$SRC/scripts/awg-stats.service" "$SRC/scripts/awg-stats.timer" /etc/systemd/system/ 2>/dev/null || true
-systemctl daemon-reload
-systemctl enable --now amnezia-panel awg-stats.timer >/dev/null 2>&1
+if [[ -f "$SRC/scripts/awg-stats.service" && -f "$SRC/scripts/awg-stats.timer" ]]; then
+  cp "$SRC/scripts/awg-stats.service" "$SRC/scripts/awg-stats.timer" /etc/systemd/system/
+else
+  cat > /etc/systemd/system/awg-stats.service <<EOF
+[Unit]
+Description=AmneziaWG panel traffic stats collector
 
-# seed panel settings into DB
-sleep 1
+[Service]
+Type=oneshot
+Environment=AWG_DB=/var/lib/amnezia-panel/panel.db
+ExecStart=/usr/bin/python3 /opt/amnezia-panel/api/wg.py --collect
+EOF
+  cat > /etc/systemd/system/awg-stats.timer <<EOF
+[Unit]
+Description=Collect AmneziaWG traffic stats every minute
+
+[Timer]
+OnBootDelaySec=30
+OnUnitActiveSec=60s
+
+[Install]
+WantedBy=timers.target
+EOF
+fi
+systemctl daemon-reload
+
+# seed panel settings into DB (direct sqlite writes — server not running yet)
 python3 - <<PYEOF
-import sys; sys.path.insert(0,'/opt/amnezia-panel/api')
-import os; os.environ.setdefault('AWG_DB','/var/lib/amnezia-panel/panel.db')
-from db import set_setting
-for k,v in {
+import json, sqlite3
+cfg = {
  "endpoint_host":"$DOMAIN","port":"$WG_PORT","subnet":"$SUBNET_V4.0/24",
  "server_ip":"$SERVER_V4/24","server_ipv6":"fdaa:bd4c:1234::1/64",
  "pfs":"1","amnezia_enabled":"1","jc":"3","jmin":"50","jmax":"90",
  "s1":"857","s2":"1271","st":"0","default_dns":"1.1.1.1, 8.8.8.8",
  "default_mtu":"1420","site_name":"AmneziaWG Panel",
-}.items(): set_setting(k,v)
+}
+con = sqlite3.connect('/var/lib/amnezia-panel/panel.db')
+con.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+con.executemany('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', list(cfg.items()))
+con.commit(); con.close()
 PYEOF
-systemctl restart amnezia-panel
 
-# ---------------------------------------------------------------- 9. nginx + TLS
-say "Выпуск сертификата Let's Encrypt для $DOMAIN..."
-apt-get install -y -qq certbot python3-certbot-nginx >/dev/null 2>&1
-
-# temporary self-signed so nginx can start before certbot replaces it
-CERTDIR=/etc/letsencrypt/live/$DOMAIN
-mkdir -p "$CERTDIR"
-if [[ ! -f "$CERTDIR/fullchain.pem" ]]; then
-  openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
-    -keyout "$CERTDIR/privkey.pem" -out "$CERTDIR/fullchain.pem" \
-    -subj "/CN=$DOMAIN" >/dev/null 2>&1
+systemctl enable --now amnezia-panel awg-stats.timer >/dev/null 2>&1
+sleep 1
+if ! systemctl is-active --quiet amnezia-panel; then
+  warn "Сервис панели не запустился — последние строки журнала:"
+  journalctl -u amnezia-panel -n 20 --no-pager || tail -n 20 /var/log/amnezia-install.log
+  die "Сервис amnezia-panel аварийный. Исправьте /opt/amnezia-panel/api/server.py и выполните: systemctl restart amnezia-panel"
 fi
-
-sed "s/__DOMAIN__/$DOMAIN/g" "$SRC/scripts/nginx.conf.template" \
-  > /etc/nginx/sites-available/amnezia-panel 2>/dev/null \
-|| die "nginx template missing"
-ln -sf /etc/nginx/sites-available/amnezia-panel /etc/nginx/sites-enabled/amnezia-panel
-rm -f /etc/nginx/sites-enabled/default
-nginx -t >/dev/null && systemctl reload nginx
-
-CERT_OK=0
-if certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos \
-     -m "admin@$DOMAIN" --redirect --keep-until-expiring >/dev/null 2>&1; then
-  CERT_OK=1
-  say "Сертификат Let's Encrypt выдан успешно ✔"
+if curl -fsS --max-time 5 http://127.0.0.1:8777/api/ping >/dev/null 2>&1; then
+  say "API панели отвечает на 127.0.0.1:8777 ✔"
 else
-  warn "certbot не смог получить сертификат (проверьте DNS/A-запись и порты 80/443)."
-  warn "Панель работает на временном самоподписанном сертификате."
+  warn "API панели не отвечает на /api/ping — проверьте: systemctl status amnezia-panel"
 fi
-systemctl enable certbot.timer >/dev/null 2>&1 || (crontab -l 2>/dev/null; \
-  echo "0 3 * * * certbot renew --quiet --deploy-hook 'systemctl reload nginx'") | crontab -
 
 # ---------------------------------------------------------------- 10. done
 URL="https://$DOMAIN"
@@ -266,11 +379,13 @@ cat <<EOF
   📡 AmneziaWG endpoint: $DOMAIN:$WG_PORT (UDP)
   🔒 Серверный pubkey  : $(cat /etc/amnezia-panel/server_public.key)
   $( [[ $CERT_OK == 1 ]] && echo "🛂 TLS: Let's Encrypt — автоматическое продление включено" \
-     || echo "🛂 TLS: самоподписанный — исправьте DNS и выполните: certbot --nginx -d $DOMAIN" )
+     || echo "🛂 TLS: самоподписанный — исправьте DNS и выполните: certbot certonly --webroot -w /var/www/html -d $DOMAIN" )
 
   Полезные команды:
     systemctl status amnezia-panel   — статус панели
+    systemctl status nginx           — статус веб-сервера
     wg show                          — активные пиры
+    ufw status                       — правила файрвола
     tail -f /var/log/amnezia-install.log — лог установки
 
   ⚠️  Смените пароль администратора после первого входа!
