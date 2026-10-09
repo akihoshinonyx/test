@@ -17,12 +17,63 @@ def gen_privkey():
     return base64.b64encode(secrets.token_bytes(32)).decode()
 
 
+def _pubkey_python(priv):
+    """Pure-python X25519 scalar mult (RFC 7748 ladder) -> public key.
+
+    Fallback so the panel can derive public keys even if the 'wg' binary is
+    missing (e.g. minimal container / broken install)."""
+    p = 2 ** 255 - 19
+    a24 = 121665
+
+    def cswap(swap, x_2, x_3):
+        dummy = swap * (x_2 - x_3)
+        return (x_2 - dummy) % p, (x_3 + dummy) % p
+
+    k = int.from_bytes(base64.b64decode(priv), "little")
+    k &= (1 << 254) - 8          # clamp scalar per RFC 7748
+    k |= 1 << 254
+    k &= ~(1 << 255)
+
+    u = 9
+    x_1, x_2, z_2, x_3, z_3 = u, 1, 0, u, 1
+    swap = 0
+    for t in range(254, -1, -1):
+        k_t = (k >> t) & 1
+        swap ^= k_t
+        x_2, x_3 = cswap(swap, x_2, x_3)
+        z_2, z_3 = cswap(swap, z_2, z_3)
+        swap = k_t
+        A = (x_2 + z_2) % p
+        AA = A * A % p
+        B = (x_2 - z_2) % p
+        BB = B * B % p
+        E = (AA - BB) % p
+        C = (x_3 + z_3) % p
+        D = (x_3 - z_3) % p
+        DA = D * A % p
+        CB = C * B % p
+        x_3 = (DA + CB) % p
+        x_3 = x_3 * x_3 % p
+        dcb = (DA - CB) % p
+        z_3 = x_1 * dcb % p * dcb % p
+        x_2 = AA * BB % p
+        z_2 = E * ((AA + a24 * E) % p) % p
+    if swap:
+        x_2, x_3 = cswap(1, x_2, x_3)
+        z_2, z_3 = cswap(1, z_2, z_3)
+    res = x_2 * pow(z_2, p - 2, p) % p
+    return base64.b64encode(res.to_bytes(32, "little")).decode()
+
+
 def pubkey(priv):
-    out = subprocess.run(
-        ["wg", "pubkey", "/dev/stdin"],
-        input=priv.encode(), capture_output=True, check=True,
-    )
-    return out.stdout.decode().strip()
+    try:
+        out = subprocess.run(
+            ["wg", "pubkey", "/dev/stdin"],
+            input=priv.encode(), capture_output=True, check=True,
+        )
+        return out.stdout.decode().strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return _pubkey_python(priv)
 
 
 def gen_psk():
@@ -127,14 +178,84 @@ def render_conf():
     return "\n".join(out) + "\n"
 
 
+def _direct_up():
+    """Bring wg0 up without wg-quick (fallback when systemd units are broken).
+
+    Mirrors what install.sh does: create interface, set address/up, and add a
+    masquerade rule for the tunnel subnet.
+    """
+    import ipaddress as _ipa
+    iface = "wg0"
+    server_ip = get_setting("server_ip", "") or ""
+    conf = render_conf()
+    key_m = re.search(r"^PrivateKey\s*=\s*(\S+)", conf, re.M)
+    if not key_m:
+        return False, "no PrivateKey in rendered config"
+    priv = key_m.group(1)
+    cmds = [
+        ["ip", "link", "del", iface],          # ignore failure if absent
+        ["ip", "tuntap", "add", "dev", iface, "mode", "wireguard"],
+        ["wg", "set-key", iface, "private-key", "-"],
+        ["ip", "addr", "add", server_ip or "10.66.66.1/24", "dev", iface],
+        ["ip", "link", "set", iface, "up"],
+    ]
+    err = ""
+    for c in cmds:
+        try:
+            r = subprocess.run(c, capture_output=True, text=True,
+                               input=priv if c[1] == "set-key" else None)
+        except FileNotFoundError:
+            return False, "%s не найден" % c[0]
+        if r.returncode != 0 and c[:3] != ["ip", "link", "del"]:
+            err = (r.stderr or r.stdout).strip()
+    try:
+        net = _ipa.ip_network(server_ip.split("/")[0] + ("/%d" % (int((server_ip.split("/")[1]) if "/" in server_ip else 24))), strict=False) if "/" in server_ip else _ipa.ip_network(get_setting("subnet", "10.66.66.0/24"), strict=False)
+        subprocess.run(["iptables", "-t", "nat", "-A", "POSTROUTING",
+                        "-s", str(net), "-o", "+", "-j", "MASQUERADE"],
+                       capture_output=True)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["wg", "showconf", iface], capture_output=True, text=True)
+    except FileNotFoundError:
+        return False, "утилита wg не найдена"
+    return r.returncode == 0, err or (r.stderr or "")
+
+
 def apply_config():
     conf = render_conf()
-    with open(CONF, "w") as f:
-        f.write(conf)
-    os.chmod(CONF, 0o600)
-    subprocess.run(["wg-quick", "down", "wg0"], capture_output=True)
-    r = subprocess.run(["wg-quick", "up", "wg0"], capture_output=True, text=True)
-    return r.returncode == 0, (r.stderr or r.stdout)
+    try:
+        os.makedirs(os.path.dirname(CONF), exist_ok=True)
+        with open(CONF, "w") as f:
+            f.write(conf)
+        os.chmod(CONF, 0o600)
+    except OSError as e:
+        return False, "не удалось записать %s: %s" % (CONF, e)
+
+    def _wg_quick(args):
+        try:
+            return subprocess.run(["wg-quick"] + args, capture_output=True, text=True)
+        except FileNotFoundError:
+            class _R:
+                returncode, stderr, stdout = 127, "wg-quick не установлен", ""
+            return _R()
+
+    _wg_quick(["down", "wg0"])
+    r = _wg_quick(["up", "wg0"])
+    ok = r.returncode == 0
+    out = (r.stderr or r.stdout)
+    if not ok:
+        # wg-quick failed (e.g. systemd unit in 'failed' state) — retry once
+        subprocess.run(["systemctl", "reset-failed", "wg-quick@wg0.service"],
+                       capture_output=True)
+        r = _wg_quick(["up", "wg0"])
+        ok = r.returncode == 0
+        out = (r.stderr or r.stdout)
+    if not ok:
+        ok, out = _direct_up()
+        if ok:
+            out = "wg0 поднят напрямую (wg-quick/systemd недоступен)"
+    return ok, out
 
 
 def peer_status():

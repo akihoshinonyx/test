@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """AmneziaWG 3.0 control panel — stdlib-only HTTP API + static web UI."""
+import ipaddress
 import json
 import mimetypes
 import os
@@ -138,16 +139,14 @@ def detect_netmask(iface):
 
 
 def detect_ipv6_address(iface):
-    """Global (non-link-local) IPv6 address of the server, or ''."""
+    """Global (non-link-local, non-loopback) IPv6 address of the server, or ''."""
     try:
         for line in _read_file("/proc/net/if_inet6").splitlines():
             p = line.split()
             if len(p) >= 6 and p[4] != "lo":
                 raw = p[0]
-                addr = ":".join(raw[i:i + 4] for i in range(0, 32, 4))
-                addr = addr.replace(":0000", ":").lstrip("0")
-                if addr.startswith("fe80"):
-                    continue
+                if raw == "0" * 32 or raw.startswith("fe80"):
+                    continue  # skip ::1 and link-local addresses
                 return socket.inet_ntop(socket.AF_INET6, bytes.fromhex(raw))
     except Exception:
         pass
@@ -221,13 +220,10 @@ def _pick_tunnel_v4(detected_ip):
                 except Exception:
                     pass
     for n in range(66, 254):
-        cand = ipaddress.ip_network("10.%d.%d.0/24" % (n, (n * 7) % 254))
-        if not any(c.overlaps(u) for u in used):
-            return str(cand), "%s/24" % list(cand.hosts())[0]
+        cand_net = ipaddress.ip_network("10.%d.%d.0/24" % (n, (n * 7) % 254))
+        if not any(cand_net.overlaps(u) for u in used):
+            return str(cand_net), "%s/24" % list(cand_net.hosts())[0]
     return "10.66.66.0/24", "10.66.66.1/24"
-
-
-import ipaddress  # noqa: E402  (used by helpers above)
 
 
 def detect_network_settings():
@@ -239,7 +235,7 @@ def detect_network_settings():
     v6_cur = db.get_setting("server_ipv6", "") or ""
     if v6_pub:
         server_ipv6 = v6_pub
-    elif v6_cur and ":" in v6_cur:
+    elif v6_cur and ":" in v6_cur and not v6_cur.startswith("::1"):
         server_ipv6 = v6_cur
     else:
         server_ipv6 = ""
@@ -969,9 +965,12 @@ class Handler(BaseHTTPRequestHandler):
         """Re-detect network settings from the server and persist them."""
         self.require(admin=True)
         det, saved = apply_detected_network(persist=True)
-        ok, err = wg.apply_config()
+        try:
+            ok, err = wg.apply_config()
+        except Exception as e:
+            ok, err = False, repr(e)
         self.json_out({"ok": True, "detected": det, "applied_keys": sorted(saved),
-                       "wg_applied": ok, "apply_error": err if not ok else None})
+                       "wg_applied": ok, "apply_error": (str(err)[:300]) if not ok else None})
 
     def api_stats(self):
         u = self.require()
