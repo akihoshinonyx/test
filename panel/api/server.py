@@ -22,19 +22,30 @@ import wg
 WEB_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 PORT = int(os.environ.get("AWG_PORT", "8777"))
 
-db.init_db()
-db.sync_admin_login()
+
+def _log(msg):
+    line = "[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    sys.stderr.write(line)
+    try:
+        with open("/var/log/amnezia-panel.log", "a") as f:
+            f.write(line)
+    except OSError:
+        pass
 
 
 def _fatal(msg):
     """Print a loud diagnostic to stderr/journal and exit non-zero."""
-    sys.stderr.write("=" * 60 + "\n[FATAL] %s\n" % msg)
-    try:
-        with open("/var/log/amnezia-panel.log", "a") as f:
-            f.write("[FATAL] %s\n" % msg)
-    except OSError:
-        pass
+    _log("[FATAL] %s" % msg)
     sys.exit(1)
+
+
+try:
+    db.init_db()
+    db.sync_admin_login()
+except Exception as e:
+    # never crash at import: the HTTP server must come up so nginx doesn't
+    # return 502; login will report the problem instead.
+    _log("[warn] init_db/sync failed: %r" % (e,))
 
 
 # ---------------- helpers ----------------
@@ -72,6 +83,197 @@ SETTINGS_KEYS = [
     "pfs", "amnezia_enabled", "jc", "jmin", "jmax", "s1", "s2", "st",
     "default_dns", "default_mtu", "site_name",
 ]
+
+AUTO_NET_KEYS = ["endpoint_host", "port", "subnet", "server_ip",
+                 "server_ipv6", "default_dns", "default_mtu"]
+
+
+# ---------- automatic network detection (settings are auto-filled from the server) ----------
+
+def _read_file(path):
+    try:
+        with open(path, errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def detect_public_ip():
+    """Public IPv4 of this server (UDP-socket trick — no traffic leaves unless sent)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(2)
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return ""
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def detect_default_iface():
+    out = _run_shell("ip route show default 2>/dev/null | awk '/default/{print $5; exit}'")
+    return out.strip()
+
+
+def detect_netmask(iface):
+    """IPv4 netmask of an interface in CIDR bits (e.g. '24')."""
+    if not iface:
+        return "24"
+    try:
+        import fcntl
+        import struct
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        mask = struct.unpack(
+            "!I", fcntl.ioctl(s.fileno(), 0x891b,
+                              struct.pack("256s", iface[:15].encode()))[20:24])[0]
+        s.close()
+        bits = bin(mask).count("1")
+        return str(bits if 0 < bits <= 32 else 24)
+    except Exception:
+        return "24"
+
+
+def detect_ipv6_address(iface):
+    """Global (non-link-local) IPv6 address of the server, or ''."""
+    try:
+        for line in _read_file("/proc/net/if_inet6").splitlines():
+            p = line.split()
+            if len(p) >= 6 and p[4] != "lo":
+                raw = p[0]
+                addr = ":".join(raw[i:i + 4] for i in range(0, 32, 4))
+                addr = addr.replace(":0000", ":").lstrip("0")
+                if addr.startswith("fe80"):
+                    continue
+                return socket.inet_ntop(socket.AF_INET6, bytes.fromhex(raw))
+    except Exception:
+        pass
+    return ""
+
+
+def detect_dns_servers():
+    servers = []
+    for line in _read_file("/etc/resolv.conf").splitlines():
+        if line.strip().startswith("nameserver"):
+            parts = line.split()
+            if len(parts) >= 2:
+                ip = parts[1]
+                # skip local resolv stubs (127.0.x.x / ::1) — useless for clients
+                if ip.startswith("127.") or ip == "::1":
+                    continue
+                servers.append(ip)
+    if not servers:
+        servers = ["1.1.1.1", "8.8.8.8"]
+    return ", ".join(servers[:2])
+
+
+def detect_mtu(iface):
+    if not iface:
+        return 1420
+    try:
+        mtu = int(_read_file("/sys/class/net/%s/mtu" % iface).strip() or 0)
+    except ValueError:
+        mtu = 0
+    if mtu <= 0:
+        return 1420
+    return max(1280, min(mtu - 80, 1420))
+
+
+def _run_shell(cmd, timeout=10):
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=timeout)
+        return p.stdout or ""
+    except Exception:
+        return ""
+
+
+def _v4_in_network(addr, cidr):
+    try:
+        return ipaddress.ip_address(addr) in ipaddress.ip_network(cidr, strict=False)
+    except Exception:
+        return False
+
+
+def _pick_tunnel_v4(detected_ip):
+    """Keep a manually configured tunnel subnet if it is still set & valid."""
+    cur_subnet = db.get_setting("subnet", "") or ""
+    cur_srv = db.get_setting("server_ip", "") or ""
+    if cur_subnet and cur_srv:
+        try:
+            net = ipaddress.ip_network(cur_subnet, strict=False)
+            srv_ip = cur_srv.split("/")[0]
+            if (net.version == 4 and str(net.network_address) != detected_ip
+                    and _v4_in_network(srv_ip, str(net))):
+                return cur_subnet, cur_srv
+        except Exception:
+            pass
+    # pick a /24 that does not clash with any directly connected network
+    used = []
+    for line in _run_shell("ip -o -4 addr show scope global 2>/dev/null").splitlines():
+        for tok in line.split():
+            if "/" in tok:
+                try:
+                    used.append(ipaddress.ip_network(tok, strict=False))
+                except Exception:
+                    pass
+    for n in range(66, 254):
+        cand = ipaddress.ip_network("10.%d.%d.0/24" % (n, (n * 7) % 254))
+        if not any(c.overlaps(u) for u in used):
+            return str(cand), "%s/24" % list(cand.hosts())[0]
+    return "10.66.66.0/24", "10.66.66.1/24"
+
+
+import ipaddress  # noqa: E402  (used by helpers above)
+
+
+def detect_network_settings():
+    """Auto-detect all network settings from the current server state."""
+    pub = detect_public_ip()
+    iface = detect_default_iface()
+    subnet, server_ip = _pick_tunnel_v4(pub)
+    v6_pub = detect_ipv6_address(iface)
+    v6_cur = db.get_setting("server_ipv6", "") or ""
+    if v6_pub:
+        server_ipv6 = v6_pub
+    elif v6_cur and ":" in v6_cur:
+        server_ipv6 = v6_cur
+    else:
+        server_ipv6 = ""
+    port_raw = db.get_setting("port", "") or ""
+    try:
+        port = int(port_raw)
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except (TypeError, ValueError):
+        port = 443
+    return {
+        "iface": iface,
+        "public_ip": pub,
+        "netmask_bits": detect_netmask(iface),
+        "endpoint_host": db.get_setting("endpoint_host", "") or pub,
+        "port": str(port),
+        "subnet": subnet,
+        "server_ip": server_ip,
+        "server_ipv6": server_ipv6,
+        "default_dns": detect_dns_servers(),
+        "default_mtu": str(detect_mtu(iface)),
+    }
+
+
+def apply_detected_network(persist=True):
+    """Write auto-detected network values into settings (skips manual overrides)."""
+    det = detect_network_settings()
+    saved = {}
+    for k in AUTO_NET_KEYS:
+        if db.get_setting("auto_" + k, "1") != "0" and det.get(k):
+            if persist:
+                db.set_setting(k, det[k])
+            saved[k] = det[k]
+    return det, saved
 
 
 def certbot_available():
@@ -112,25 +314,153 @@ def _ensure_noise_key():
         sys.stderr.write("[warn] noise key init failed: %s\n" % e)
 
 
+def _iface_conf_ok(path):
+    """Validate a wg0.conf-style file: [Interface] + PrivateKey + ListenPort."""
+    try:
+        with open(path) as f:
+            t = f.read()
+        return ("[interface]" in t.lower() and "privatekey" in t.lower()
+                and "listenport" in t.lower())
+    except OSError:
+        return False
+
+
+def _ensure_wg_conf_file():
+    """Make sure /etc/wireguard/wg0.conf exists and is valid.
+
+    wg-quick@wg0.service reads exactly that path; if it was deleted by an
+    uninstall run, replaced by a broken symlink or overwritten with garbage,
+    the unit shows 'failed' in the maintenance page forever.
+    """
+    panel_conf = "/etc/amnezia-panel/wg.conf"
+    if not _iface_conf_ok(panel_conf):
+        try:
+            ok, err = wg.apply_config()  # renders a full valid config there
+            if not ok:
+                _log("[warn] apply_config while fixing wg.conf: %s" % err)
+        except Exception as e:
+            _log("[warn] cannot render wg.conf: %r" % (e,))
+    target = "/etc/wireguard/wg0.conf"
+    try:
+        os.makedirs("/etc/wireguard", exist_ok=True)
+        need = True
+        if os.path.islink(target) and os.path.realpath(target) == os.path.realpath(panel_conf):
+            need = False
+        elif os.path.isfile(target) and _iface_conf_ok(target):
+            need = False
+        if need:
+            tmp = target + ".new"
+            with open(panel_conf) as src, open(tmp, "w") as dst:
+                dst.write(src.read())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+            _log("recreated /etc/wireguard/wg0.conf from panel settings")
+    except Exception as e:
+        _log("[warn] cannot fix /etc/wireguard/wg0.conf: %r" % (e,))
+
+
+def _systemd_set_iface(iface):
+    """Point wg-quick@.service at our own config file via a drop-in override."""
+    d = "/etc/systemd/system/wg-quick@.service.d"
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "amnezia-panel.conf"), "w") as f:
+            f.write("[Service]\nEnvironment=WG_QUICK_IFACE=%s\n" % iface)
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=20)
+    except Exception as e:
+        _log("[warn] systemd drop-in for wg-quick failed: %r" % (e,))
+
+
+def _bring_up_directly(conf):
+    """Fallback: bring wg0 up with `ip` + `wg` when wg-quick is unavailable/fails."""
+    try:
+        subprocess.run(["ip", "link", "del", "wg0"], capture_output=True, timeout=10)
+        priv = None
+        addr = port = None
+        with open(conf) as f:
+            for line in f:
+                parts = line.split("=", 1)
+                if len(parts) != 2:
+                    continue
+                k, v = parts[0].strip().lower(), parts[1].strip()
+                if k == "privatekey":
+                    priv = v
+                elif k == "address" and addr is None:
+                    addr = v
+                elif k == "listenport":
+                    port = v
+        if not priv or not addr:
+            return False
+        cmds = [
+            ["ip", "link", "add", "wg0", "type", "wireguard",
+             "private-key", priv, "listen-port", port or "443"],
+            ["ip", "addr", "add", addr, "dev", "wg0"],
+            ["ip", "link", "set", "wg0", "up"],
+        ]
+        for c in cmds:
+            r = subprocess.run(c, capture_output=True, timeout=15)
+            if r.returncode != 0:
+                return False
+        # add active peers straight from the rendered config
+        section = None
+        peer = {}
+        with open(conf) as f:
+            lines = f.read().splitlines() + [""]
+        for line in lines:
+            s = line.strip()
+            if s.startswith("["):
+                if section == "peer" and peer.get("publickey"):
+                    args = ["wg", "set", "wg0", "peer", peer["publickey"],
+                            "allowed-ips", peer.get("allowedips", "0.0.0.0/0")]
+                    if peer.get("presharedkeyfile"):
+                        args += ["preshared-key", peer["presharedkeyfile"]]
+                    subprocess.run(args, capture_output=True, timeout=15)
+                section = "interface" if "interface" in s.lower() else \
+                          ("peer" if "peer" in s.lower() else None)
+                peer = {}
+            elif "=" in s and section == "peer":
+                k, v = [x.strip() for x in s.split("=", 1)]
+                peer[k.lower()] = v
+        r = subprocess.run(["wg", "show"], capture_output=True, text=True, timeout=10)
+        return "wg0" in (r.stdout or "")
+    except Exception as e:
+        _log("[warn] direct wg0 bring-up failed: %r" % (e,))
+        return False
+
+
 def _ensure_wg_interface_up():
     """Bring wg0 up if it is down (idempotent; safe to call on every start)."""
     try:
-        r = subprocess.run(["wg", "show"], capture_output=True, text=True, timeout=10)
-        if "wg0" in (r.stdout or ""):
+        r = subprocess.run(["ip", "-o", "link", "show", "wg0"],
+                           capture_output=True, text=True, timeout=10)
+        state = (r.stdout or "")
+        if r.returncode == 0 and "state UP" in state:
             return True
     except Exception:
         pass
+    _ensure_wg_conf_file()
+    _systemd_set_iface("wg0")
+    conf = "/etc/wireguard/wg0.conf"
     try:
-        conf = "/etc/amnezia-panel/wg.conf"
-        if not os.path.exists(conf):
-            conf = "/etc/wireguard/wg0.conf"
-        if os.path.exists(conf):
-            subprocess.run(["wg-quick", "up", "wg0"], capture_output=True, timeout=30)
-            r = subprocess.run(["wg", "show"], capture_output=True, text=True, timeout=10)
-            return "wg0" in (r.stdout or "")
-    except Exception:
-        pass
-    return False
+        subprocess.run(["wg-quick", "down", "wg0"], capture_output=True, timeout=30)
+        r = subprocess.run(["wg-quick", "up", "wg0"], capture_output=True,
+                           text=True, timeout=30)
+        ok = r.returncode == 0
+        if not ok:
+            _log("[warn] wg-quick up failed: %s — trying direct ip/wg bring-up"
+                 % ((r.stderr or r.stdout or "").strip()[:200]))
+            ok = _bring_up_directly(conf)
+        if ok:
+            subprocess.run(["systemctl", "reset-failed", "wg-quick@wg0.service"],
+                           capture_output=True, timeout=15)
+            subprocess.run(["systemctl", "restart", "wg-quick@wg0.service"],
+                           capture_output=True, timeout=30)
+        chk = subprocess.run(["ip", "-o", "link", "show", "wg0"],
+                             capture_output=True, text=True, timeout=10)
+        return "state UP" in (chk.stdout or "")
+    except Exception as e:
+        _log("[warn] ensure wg0 up failed: %r" % (e,))
+        return False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -194,7 +524,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self.dispatch("DELETE")
 
-    def dispatch(self, method):
+    def do_HEAD(self):
+        # nginx probes / curl -I compatibility: serve headers only
+        self.dispatch("GET", head=True)
+
+    def dispatch(self, method, head=False):
         path = urlparse(self.path).path
         try:
             for regex, mth, fn in ROUTES:
@@ -204,7 +538,7 @@ class Handler(BaseHTTPRequestHandler):
                 if mo:
                     return fn(self, *(mo.groups()))
             if method == "GET":
-                return self.serve_static(path)
+                return self.serve_static(path, head=head)
             self.json_out({"error": "not found"}, 404)
         except PermissionError as e:
             self.json_out({"error": str(e)}, 403)
@@ -213,11 +547,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self.json_out({"error": "internal: %s" % e}, 500)
 
-    def serve_static(self, path):
+    def serve_static(self, path, head=False):
         if path == "/":
             path = "/index.html"
         full = os.path.normpath(os.path.join(WEB_ROOT, path.lstrip("/")))
         if not full.startswith(WEB_ROOT) or not os.path.isfile(full):
+            # unknown API paths -> JSON 404 instead of the SPA shell
+            if path.startswith("/api/"):
+                return self.json_out({"error": "not found"}, 404)
             full = os.path.join(WEB_ROOT, "index.html")
             if not os.path.isfile(full):
                 return self._send(404, "not found", "text/plain")
@@ -239,7 +576,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_login(self):
         d = self.read_body()
-        u = db.get_user_by_login(d.get("username", "").strip(), d.get("password", ""))
+        try:
+            u = db.get_user_by_login(d.get("username", "").strip(), d.get("password", ""))
+        except Exception as e:
+            _log("[error] login: DB failure: %r" % (e,))
+            return self.json_out({
+                "error": "Ошибка базы данных панели: %s. Выполните на сервере: "
+                         "journalctl -u amnezia-panel -n 50" % e}, 500)
         if not u:
             time.sleep(0.4)
             return self.json_out({"error": "Неверный логин или пароль"}, 401)
@@ -586,6 +929,12 @@ class Handler(BaseHTTPRequestHandler):
         out = {}
         for k in SETTINGS_KEYS:
             out[k] = db.get_setting(k, "")
+        for k in AUTO_NET_KEYS:
+            out["auto_" + k] = "0" if db.get_setting("auto_" + k, "1") == "0" else "1"
+        try:
+            out["detected"] = detect_network_settings()
+        except Exception as e:
+            out["detected"] = {"error": str(e)}
         self.json_out(out)
 
     def api_settings_put(self):
@@ -597,8 +946,32 @@ class Handler(BaseHTTPRequestHandler):
         for k in ("user_key_limit", "default_transport"):
             if k in d:
                 db.set_setting(k, d[k])
+        for k in AUTO_NET_KEYS:
+            flag = "auto_" + k
+            if flag in d:
+                db.set_setting(flag, "0" if str(d[flag]) in ("0", "false", "off") else "1")
         ok, err = wg.apply_config()
         self.json_out({"ok": True, "applied": ok, "apply_error": err if not ok else None})
+
+    def api_net_detect(self):
+        """Preview what auto-detection would set (no writes)."""
+        self.require(admin=True)
+        try:
+            det = detect_network_settings()
+        except Exception as e:
+            raise ValueError("Ошибка автообнаружения сети: %s" % e)
+        cur = {k: db.get_setting(k, "") for k in AUTO_NET_KEYS}
+        changed = {k: v for k, v in det.items()
+                   if k in AUTO_NET_KEYS and cur.get(k) != v}
+        self.json_out({"detected": det, "current": cur, "changed": changed})
+
+    def api_net_apply(self):
+        """Re-detect network settings from the server and persist them."""
+        self.require(admin=True)
+        det, saved = apply_detected_network(persist=True)
+        ok, err = wg.apply_config()
+        self.json_out({"ok": True, "detected": det, "applied_keys": sorted(saved),
+                       "wg_applied": ok, "apply_error": err if not ok else None})
 
     def api_stats(self):
         u = self.require()
@@ -695,7 +1068,19 @@ class Handler(BaseHTTPRequestHandler):
             "certbot": certbot_available(),
             "letsencrypt_cert": cert_ok,
             "domain": domain,
+            "db_path": db.DB_PATH,
+            "db_size_bytes": (os.path.getsize(db.DB_PATH)
+                              if os.path.exists(db.DB_PATH) else 0),
+            "panel_log_tail": self._log_tail("/var/log/amnezia-panel.log", 30),
         })
+
+    @staticmethod
+    def _log_tail(path, n):
+        try:
+            with open(path, "r", errors="replace") as f:
+                return "".join(f.readlines()[-n:])
+        except OSError:
+            return ""
 
     def api_uninstall_preview(self):
         self.require(admin=True)
@@ -812,6 +1197,8 @@ ROUTES = [
     (R(r"^/api/password$"), "POST", Handler.api_my_password),
     (R(r"^/api/settings$"), "GET", Handler.api_settings_get),
     (R(r"^/api/settings$"), "PUT", Handler.api_settings_put),
+    (R(r"^/api/network/detect$"), "GET", Handler.api_net_detect),
+    (R(r"^/api/network/apply$"), "POST", Handler.api_net_apply),
     (R(r"^/api/reload$"), "POST", Handler.api_reload),
     (R(r"^/api/maintenance$"), "GET", Handler.api_maintenance_status),
     (R(r"^/api/uninstall/preview$"), "GET", Handler.api_uninstall_preview),
@@ -841,6 +1228,13 @@ def main():
     # self-heal critical state before serving (pubkey cache, noise key, wg0)
     _ensure_noise_key()
     _derive_server_pubkey()
+    # auto-configure network settings from the actual server state
+    try:
+        det, saved = apply_detected_network(persist=True)
+        if saved:
+            _log("network settings auto-configured: %s" % ", ".join(sorted(saved)))
+    except Exception as e:
+        _log("[warn] network auto-detect failed: %r" % (e,))
     threading.Thread(target=_ensure_wg_interface_up, daemon=True).start()
 
     t = threading.Thread(target=background_loop, daemon=True)

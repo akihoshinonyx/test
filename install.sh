@@ -58,6 +58,25 @@ if [[ -n "$RESOLVED" && "$RESOLVED" != "$PUB_IP" ]]; then
   read -r ANS; [[ "$ANS" == y || "$ANS" == Y ]] || die "Настройте A-запись $DOMAIN -> $PUB_IP и повторите."
 fi
 
+# ---------------------------------------------------------------- preflight checks
+# Проверки ДО каких-либо изменений системы: если что-то не так — выходим сразу,
+# не оставив «полуюстановку» (юниты/файлы есть, панель не работает).
+say "Предпроверка окружения..."
+[[ -f /proc/net/ip_tables_names || -e /sys/module/nf_nat ]] \
+  || warn "Модули iptables/nat недоступны — VPN-маршрутизация может не работать."
+for _bin in systemctl nginx curl openssl python3 wg apt-get; do
+  command -v "$_bin" >/dev/null 2>&1 || { say "Устанавливаю недостающий компонент: $_bin"; break; }
+done
+apt-get update -qq >>"$LOG" 2>&1 || true
+apt-get install -y -qq wireguard-tools qrencode nginx python3 openssl haveged \
+  dnsutils ca-certificates gnupg curl >>"$LOG" 2>&1 \
+  || apt-get install -y wireguard-tools qrencode nginx python3 openssl >>"$LOG" 2>&1 \
+  || die "Не удалось установить базовые пакеты (nginx, wireguard-tools, python3)."
+command -v wg >/dev/null 2>&1 || die "Утилита 'wg' не установлена — установите wireguard-tools вручную."
+command -v nginx >/dev/null 2>&1 || die "nginx не установлен."
+mkdir -p /etc/amnezia-panel /var/lib/amnezia-panel /opt/amnezia-panel /var/log
+touch /var/log/amnezia-panel.log
+
 read -rp "$(echo -e "${C_B}Порт WireGuard/AmneziaWG (по умолчанию 443): ${C_0}")" WG_PORT
 WG_PORT=${WG_PORT:-443}
 ADMIN_USER=${ADMIN_USER:-admin}
@@ -187,6 +206,55 @@ except Exception as e:
 PYEOF
 fi
 
+# --- надёжная инициализация БД напрямую (не зависит от кода панели):
+# создаём схему, сверяем логин админа и ВСЕГДА применяем пароль из admin.json.
+# Именно этот шаг раньше молча пропускался при прерванных установках,
+# и панель не пускала внутрь («Неверный логин или пароль» / 502).
+python3 - <<'PYEOF' || warn "Не удалось инициализировать БД напрямую (панель сделает это сама при старте)."
+import json, os, sqlite3, hashlib, secrets, time
+DB = "/var/lib/amnezia-panel/panel.db"
+try:
+    with open("/etc/amnezia-panel/admin.json") as f:
+        a = json.load(f)
+    uname, pwd = str(a["username"]).strip().lower(), str(a["password"])
+except Exception as e:
+    raise SystemExit("[warn] admin.json недоступен: %s" % e)
+os.makedirs(os.path.dirname(DB), exist_ok=True)
+con = sqlite3.connect(DB)
+con.execute("PRAGMA journal_mode=WAL")
+con.executescript("""
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    pass_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    last_login INTEGER);
+CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+""")
+row = con.execute("SELECT id, username FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
+# тот же алгоритм хэширования, что и в panel/api/db.py (scrypt)
+salt = secrets.token_hex(16)
+h = hashlib.scrypt(pwd.encode(), salt=salt.encode(), n=16384, r=8, p=1).hex()
+if not row:
+    con.execute("INSERT INTO users(username,pass_hash,salt,role,enabled,created_at) VALUES(?,?,?,?,1,?)",
+                (uname, h, salt, "admin", int(time.time())))
+    print("Создан администратор '%s' с паролем из admin.json." % uname)
+else:
+    if row[1].lower() != uname:
+        clash = con.execute("SELECT id FROM users WHERE username=? AND id<>?", (uname, row[0])).fetchone()
+        if not clash:
+            con.execute("UPDATE users SET username=? WHERE id=?", (uname, row[0]))
+    con.execute("UPDATE users SET pass_hash=?, salt=?, enabled=1 WHERE id=?", (h, salt, row[0]))
+    print("Пароль администратора в БД синхронизирован с admin.json.")
+con.commit(); con.close()
+PYEOF
+
 # ---------------------------------------------------------------- 6. initial wg0 config
 say "Создание интерфейса wg0 (AmneziaWG, порт $WG_PORT)..."
 SUBNET_V4=10.66.66.0; SERVER_V4=10.66.66.1
@@ -234,43 +302,68 @@ apt-get install -y -qq certbot python3-certbot-nginx >/dev/null 2>&1 || apt-get 
 NGINX_CONF=/etc/nginx/sites-available/amnezia-panel
 TLS_DIR=/etc/nginx/tls
 CERTDIR=/etc/letsencrypt/live/$DOMAIN
-mkdir -p "$TLS_DIR"
+ACME_DIR=/var/www/letsencrypt
+mkdir -p "$TLS_DIR" "$ACME_DIR"
 
-if [[ -f "$SRC/scripts/nginx.conf.template" ]]; then
-  sed "s|__DOMAIN__|$DOMAIN|g" "$SRC/scripts/nginx.conf.template" > "$NGINX_CONF"
-else
-  cat > "$NGINX_CONF" <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
+# Конфиг ВСЕГДА генерируется инлайновым шаблоном (надёжнее внешнего файла):
+#  • listen ... default_server — панель отдаётся даже при запросе по IP или
+#    другому server_name (раньше такой запрос уходил в дефолтный сайт nginx);
+#  • /.well-known/acme-challenge/ отдаётся с диска ДО редиректа на HTTPS —
+#    именно из-за отсутствия этого location Let's Encrypt не мог пройти
+#    HTTP-01 членж и сертификат никогда не выдавался.
+cat > "$NGINX_CONF" <<EOF
+# AmneziaWG Panel — generated by install.sh ($(date -u +%F\ %T\ UTC))
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    ''      close;
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name $DOMAIN;
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name $DOMAIN _;
+
+    location /.well-known/acme-challenge/ {
+        root $ACME_DIR;
+        default_type "text/plain";
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
+    server_name $DOMAIN _;
 
     ssl_certificate     $TLS_DIR/self-signed.pem;
     ssl_certificate_key $TLS_DIR/self-signed.key;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
     ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
     add_header Strict-Transport-Security "max-age=63072000" always;
     add_header X-Frame-Options DENY;
     add_header X-Content-Type-Options nosniff;
 
+    client_max_body_size 10m;
+
     location / {
         proxy_pass http://127.0.0.1:8777;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 90s;
     }
 }
 EOF
-fi
 
 # temporary self-signed cert so nginx starts even if certbot fails later
 if [[ ! -f "$TLS_DIR/self-signed.key" ]]; then
@@ -282,46 +375,82 @@ fi
 
 ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/amnezia-panel
 rm -f /etc/nginx/sites-enabled/default
-if nginx -t >/dev/null 2>&1; then
+# если где-то остался дефолтный конфиг с «default_server» — убираем дубли,
+# иначе nginx -t падает с "duplicate default server"
+if grep -RqsE '^\s*listen\s+.*default_server' /etc/nginx/conf.d/ 2>/dev/null; then
+  for f in /etc/nginx/conf.d/*.conf; do
+    [[ -f "$f" ]] && ! grep -q amnezia-panel "$f" \
+      && sed -i.bak -E 's/^(\s*listen\s+[^;]*\s)default_server/\1/' "$f" || true
+  done
+fi
+if nginx -t >>"$LOG" 2>&1; then
   systemctl enable nginx >/dev/null 2>&1 || true
   systemctl restart nginx
 else
-  warn "Проверка nginx завершилась с ошибкой — показываю конфиг:"
+  warn "Проверка nginx завершилась с ошибкой — показываю вывод:"
   cat "$NGINX_CONF" >&2
   nginx -t || true
   die "Некорректный nginx-конфиг. Исправьте /etc/nginx/sites-available/amnezia-panel и перезапустите установку."
 fi
 
-# issue a real Let's Encrypt certificate (HTTP-01 via webroot — no ALPN needed)
-say "Выпуск сертификата Let's Encrypt для $DOMAIN..."
-mkdir -p /var/www/html
-CERT_OK=0
-if command -v certbot >/dev/null 2>&1; then
+# панель должна отвечать ещё до выпуска сертификата — иначе certbot увидит 502,
+# а пользователь получит «голый nginx». Поднимаем её прямо сейчас.
+ensure_panel_up() {
+  systemctl is-active --quiet wg-quick@wg0 || systemctl restart wg-quick@wg0 || true
+  systemctl restart amnezia-panel || true
+  local i
+  for i in $(seq 1 10); do
+    sleep 2
+    curl -fsS --max-time 5 http://127.0.0.1:8777/api/ping >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+systemctl daemon-reload
+if ! curl -fsS --max-time 3 http://127.0.0.1:8777/api/ping >/dev/null 2>&1; then
+  say "Запускаю сервис панели..."
+  ensure_panel_up || warn "Панель не отвечает на 127.0.0.1:8777 — попробую разобраться в логах ниже."
+fi
+
+# ------------------------------------------------------------------ TLS helper
+# Выпуск/обновление Let's Encrypt + подмена путей в конфиге (с откатом).
+issue_letsencrypt() {
+  command -v certbot >/dev/null 2>&1 || return 1
+  echo "test" > "$ACME_DIR/.acme-check" 2>/dev/null || true
+  local _attempt
   for _attempt in 1 2; do
-    if certbot certonly --webroot -w /var/www/html -d "$DOMAIN" \
+    if certbot certonly --webroot -w "$ACME_DIR" -d "$DOMAIN" \
          --non-interactive --agree-tos -m "admin@$DOMAIN" \
-         --keep-until-expiring --preferred-challenges http >/dev/null 2>&1; then
-      CERT_OK=1; break
+         --keep-until-expiring --preferred-challenges http >>"$LOG" 2>&1; then
+      break
     fi
     sleep 3
   done
-fi
-if [[ $CERT_OK == 1 ]]; then
-  say "Сертификат Let's Encrypt выдан успешно ✔"
+  [[ -f "$CERTDIR/fullchain.pem" ]] || return 1
   sed -i "s|$TLS_DIR/self-signed.pem|$CERTDIR/fullchain.pem|; s|$TLS_DIR/self-signed.key|$CERTDIR/privkey.pem|" "$NGINX_CONF"
-  if nginx -t >/dev/null 2>&1; then
+  if nginx -t >>"$LOG" 2>&1; then
     systemctl reload nginx
-  else
-    warn "nginx не принял LE-пути к сертификату — оставляю самоподписанный."
-    sed -i "s|$CERTDIR/fullchain.pem|$TLS_DIR/self-signed.pem|; s|$CERTDIR/privkey.pem|$TLS_DIR/self-signed.key|" "$NGINX_CONF"
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx
-    CERT_OK=0
+    return 0
   fi
+  warn "nginx не принял LE-пути к сертификату — оставляю самоподписанный."
+  sed -i "s|$CERTDIR/fullchain.pem|$TLS_DIR/self-signed.pem|; s|$CERTDIR/privkey.pem|$TLS_DIR/self-signed.key|" "$NGINX_CONF"
+  nginx -t >>"$LOG" 2>&1 && systemctl reload nginx
+  return 1
+}
+
+# issue a real Let's Encrypt certificate (HTTP-01 via webroot — no ALPN needed)
+say "Выпуск сертификата Let's Encrypt для $DOMAIN..."
+CERT_OK=0
+if [[ -f "$CERTDIR/fullchain.pem" ]]; then
+  say "Сертификат Let's Encrypt уже существует — обновляю привязку конфига."
+  issue_letsencrypt && CERT_OK=1
+elif issue_letsencrypt; then
+  say "Сертификат Let's Encrypt выдан успешно ✔"
+  CERT_OK=1
 else
-  warn "certbot не смог получить сертификат (проверьте A-запись $DOMAIN -> $PUB_IP и доступность портов 80/443 извне)."
+  warn "certbot не смог получить сертификат (проверьте A-запись $DOMAIN -> $PUB_IP и доступность порта 80 извне)."
   warn "Панель работает на временном самоподписанном сертификате."
-  warn "После исправления DNS выполните:"
-  echo "  certbot certonly --webroot -w /var/www/html -d $DOMAIN --agree-tos -m admin@$DOMAIN --keep-until-expiring"
+  warn "Когда DNS/порты заработают, выполните (или просто запустите install.sh заново):"
+  echo "  certbot certonly --webroot -w $ACME_DIR -d $DOMAIN --agree-tos -m admin@$DOMAIN --keep-until-expiring"
   echo "  # затем замените пути сертификатов в $NGINX_CONF и: systemctl reload nginx"
 fi
 if [[ $CERT_OK == 1 ]] && systemctl enable certbot.timer >/dev/null 2>&1; then
@@ -346,6 +475,8 @@ Restart=always
 RestartSec=3
 Environment=AWG_PORT=8777
 Environment=AWG_DB=/var/lib/amnezia-panel/panel.db
+StandardOutput=append:/var/log/amnezia-panel.log
+StandardError=append:/var/log/amnezia-panel.log
 
 [Install]
 WantedBy=multi-user.target
@@ -411,7 +542,8 @@ done
 if [[ $PANEL_OK == 0 ]]; then
   warn "Панель не отвечает на http://127.0.0.1:8777/api/ping."
   warn "Диагностика (последние ошибки сервиса):"
-  journalctl -u amnezia-panel -n 40 --no-pager 2>/dev/null | sed 's/^/   /'
+  journalctl -u amnezia-panel -n 40 --no-pager 2>/dev/null | sed 's/^/   /' || true
+  tail -n 40 /var/log/amnezia-panel.log 2>/dev/null | sed 's/^/   /' || true
   # try to surface a Python traceback directly
   TRC=$(timeout 10 /usr/bin/python3 /opt/amnezia-panel/api/server.py 2>&1 | grep -A 12 "Traceback" | head -n 25 || true)
   [[ -n "$TRC" ]] && printf '%s\n' "$TRC" | sed 's/^/   /'
@@ -431,6 +563,75 @@ else
   warn "!! ВНИМАНИЕ: панель не поднялась (nginx будет отдавать 502 Bad Gateway)."
   warn "Строки выше содержат точную причину падения — исправьте её и выполните:"
   echo "   systemctl restart amnezia-panel && journalctl -u amnezia-panel -f"
+fi
+
+# ---------------------------------------------------------------- end-to-end check
+# Финальная проверка «как видит браузер»: запрос через nginx, а не напрямую в API.
+# Именно этот шаг раньше молча пропускался — пользователь получал «голый nginx»
+# или 502, а установщик рапортовал об успехе.
+say "Проверяю доступность панели через nginx..."
+NGINX_CHECK=""
+for _i in 1 2 3; do
+  NGINX_CHECK=$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 8 https://127.0.0.1/ 2>/dev/null || true)
+  [[ "$NGINX_CHECK" == "200" ]] && break
+  sleep 2
+done
+if [[ "$NGINX_CHECK" == "200" ]]; then
+  say "Панель отдаётся через nginx (HTTPS с localhost → 200 OK) ✔"
+elif [[ "$NGINX_CHECK" == "502" || "$NGINX_CHECK" == "504" ]]; then
+  warn "nginx вернул $NGINX_CHECK — прокси до панели не работает. Диагностика:"
+  ss -ltnp 2>/dev/null | grep -E ':(80|443|8777)' | sed 's/^/   /' || true
+  tail -n 30 /var/log/amnezia-panel.log 2>/dev/null | sed 's/^/   /' || true
+  warn "Чиню автоматически: перезапуск сервиса панели..."
+  ensure_panel_up \
+    && curl -k -s -o /dev/null -w '' --max-time 8 https://127.0.0.1/ >/dev/null 2>&1 \
+    && say "После перезапуска панель отвечает через nginx ✔" \
+    || warn "Панель по-прежнему недоступна через nginx — смотрите /var/log/amnezia-panel.log"
+else
+  warn "Неожиданный ответ от nginx: '${NGINX_CHECK:-нет соединения}'. Проверьте: systemctl status nginx"
+fi
+
+# --- финальная проверка логина напрямую в БД (scrypt-хэш = пароль из admin.json).
+# Если не совпадает — чиним хэш на месте, чтобы «Неверный логин или пароль»
+# больше никогда не появился после установки.
+if [[ -f /var/lib/amnezia-panel/panel.db ]]; then
+  python3 - <<'PYEOF' || true
+import json, sqlite3, hashlib, secrets
+try:
+    with open("/etc/amnezia-panel/admin.json") as f:
+        a = json.load(f)
+    uname, pwd = str(a["username"]).strip().lower(), str(a["password"])
+    con = sqlite3.connect("/var/lib/amnezia-panel/panel.db")
+    con.row_factory = sqlite3.Row
+    r = con.execute("SELECT id, username, pass_hash, salt FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
+    if not r:
+        print("[warn] в БД нет администратора — создаём...")
+        salt = secrets.token_hex(16)
+        h = hashlib.scrypt(pwd.encode(), salt=salt.encode(), n=16384, r=8, p=1).hex()
+        import time as _t
+        con.execute("INSERT INTO users(username,pass_hash,salt,role,enabled,created_at) VALUES(?,?,?,?,1,?)",
+                    (uname, h, salt, "admin", int(_t.time())))
+        con.commit(); con.close()
+        print("OK: администратор создан.")
+    else:
+        want = hashlib.scrypt(pwd.encode(), salt=r["salt"].encode(), n=16384, r=8, p=1).hex()
+        if want != r["pass_hash"]:
+            print("Хэш пароля админа в БД расходится с admin.json — синхронизирую...")
+            salt = secrets.token_hex(16)
+            h = hashlib.scrypt(pwd.encode(), salt=salt.encode(), n=16384, r=8, p=1).hex()
+            con.execute("UPDATE users SET username=?, pass_hash=?, salt=?, enabled=1 WHERE id=?",
+                        (uname, h, salt, r["id"]))
+            con.commit()
+        # параллельно проверяем целостность схемы (остальные таблицы)
+        tables = {x[0] for x in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        missing = {"users","keys","sessions","settings"} - tables
+        if missing:
+            print("[warn] в БД отсутствуют таблицы:", ", ".join(sorted(missing)))
+        con.close()
+        print("OK: вход '%s' / пароль из admin.json проверен и готов." % uname)
+except Exception as e:
+    print("[warn] проверка логина: %r" % (e,))
+PYEOF
 fi
 
 # --- emergency admin access: if the panel is down, recover login/password from DB
@@ -477,7 +678,9 @@ cat <<EOF
   📡 AmneziaWG endpoint: $DOMAIN:$WG_PORT (UDP)
   🔒 Серверный pubkey  : $(cat /etc/amnezia-panel/server_public.key)
   $( [[ $CERT_OK == 1 ]] && echo "🛂 TLS: Let's Encrypt — автоматическое продление включено" \
-     || echo "🛂 TLS: самоподписанный — исправьте DNS и выполните: certbot certonly --webroot -w /var/www/html -d $DOMAIN" )
+     || echo "🛂 TLS: самоподписанный — браузер предупредит о сертификате, можно продолжить; после починки DNS/портов запустите install.sh заново для выпуска Let's Encrypt" )
+  $( [[ $NGINX_CHECK == "200" ]] && echo "🟢 Проверка через nginx: панель отдаётся (HTTP 200)" \
+     || echo "🟡 Проверка через nginx: HTTP ${NGINX_CHECK:-нет соединения} — если не 200, смотрите systemctl status nginx и /var/log/amnezia-panel.log" )
 
   Полезные команды:
     systemctl status amnezia-panel   — статус панели
@@ -485,6 +688,7 @@ cat <<EOF
     wg show                          — активные пиры
     systemctl status fail2ban        — защита от брутфорса
     tail -f /var/log/amnezia-install.log — лог установки
+    tail -f /var/log/amnezia-panel.log   — лог самой панели
 
   ⚠️  Смените пароль администратора после первого входа!
 

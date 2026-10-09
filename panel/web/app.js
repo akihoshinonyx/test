@@ -175,18 +175,36 @@ const VIEWS = {
 
   async settings() {
     const s = await api("/settings");
+    const det = s.detected || {};
+    const netRows = [
+      ["Интерфейс", det.iface], ["Публичный IP (обнаружен)", det.public_ip],
+      ["Маска подсети", det.netmask_bits ? "/" + det.netmask_bits : ""],
+      ["IPv6 сервера", det.server_ipv6], ["MTU по интерфейсу→туннелю", det.default_mtu],
+      ["DNS сервера", det.default_dns],
+    ].filter(r => r[1]);
+    const autoFld = (name, label, val, type = "text", attrs = "") => `
+      <div class="autofld">
+        <label>${label}<input type="${type}" name="${name}" value="${esc(val ?? "")}" ${attrs}></label>
+        <label class="mini-switch" title="Автонастройка по данным сервера">
+          <input type="checkbox" name="auto_${name}" ${s["auto_" + name] != "0" ? "checked" : ""}>
+          <span class="slider mini"></span><em>авто</em>
+        </label>
+      </div>`;
     $("#main").innerHTML = `
     <h2 class="page">Настройки сервера</h2>
     <form id="sf">
     <div class="grid c2">
-      <div class="card"><h3 style="margin-top:0">🌐 Сеть</h3>
-        ${fld("endpoint_host", "Домен / IP endpoint (для клиентов)", s.endpoint_host)}
-        ${fld("port", "Порт UDP (ListenPort)", s.port, "number")}
-        ${fld("subnet", "Подсеть клиентов", s.subnet)}
-        ${fld("server_ip", "IP сервера в туннеле", s.server_ip)}
-        ${fld("server_ipv6", "IPv6 в туннеле (необязательно)", s.server_ipv6)}
-        ${fld("default_dns", "DNS по умолчанию", s.default_dns)}
-        ${fld("default_mtu", "MTU по умолчанию", s.default_mtu, "number")}
+      <div class="card"><h3 style="margin-top:0">🌐 Настройки сети <span class="badge ok" style="font-size:.7em">⚡ авто</span></h3>
+        <p class="muted" style="margin-top:-4px;font-size:.85em">Поля с тумблером «авто» заполняются автоматически по информации о сервере (IP, интерфейс, DNS, MTU). Выключите «авто», чтобы задать значение вручную.</p>
+        ${autoFld("endpoint_host", "Домен / IP endpoint (для клиентов)", s.endpoint_host)}
+        ${autoFld("port", "Порт UDP (ListenPort)", s.port, "number")}
+        ${autoFld("subnet", "Подсеть клиентов", s.subnet)}
+        ${autoFld("server_ip", "IP сервера в туннеле", s.server_ip)}
+        ${autoFld("server_ipv6", "IPv6 в туннеле (необязательно)", s.server_ipv6)}
+        ${autoFld("default_dns", "DNS по умолчанию", s.default_dns)}
+        ${autoFld("default_mtu", "MTU по умолчанию", s.default_mtu, "number")}
+        <button type="button" class="btn" id="redetectBtn">🔄 Определить сеть заново</button>
+        ${netRows.length ? `<div class="detected-box">${netRows.map(r => `<div><span class=\"muted\">${r[0]}:</span> <b>${esc(r[1])}</b></div>`).join("")}</div>` : ""}
       </div>
       <div class="card"><h3 style="margin-top:0">🎭 Анти-DPI (AmneziaWG)</h3>
         ${sw("amnezia_enabled", "Включить шумовые пакеты", s.amnezia_enabled == 1 || s.amnezia_enabled === "")}
@@ -211,12 +229,21 @@ const VIEWS = {
     </div>
     <button class="btn primary block" style="max-width:300px">💾 Сохранить и применить</button>
     </form>`;
+    $("#redetectBtn").onclick = async () => {
+      try {
+        const r = await api("/network/apply", { method: "POST" });
+        toast("Сеть переопределена: обновлено " + (r.applied_keys || []).length + " параметров ✔");
+        this.settings();
+      } catch (err) { toast(err.message, "err"); }
+    };
     $("#sf").onsubmit = async e => {
       e.preventDefault();
       const f = new FormData(e.target);
       const set = {};
       for (const k of ["endpoint_host","port","subnet","server_ip","server_ipv6","default_dns","default_mtu","jc","jmin","jmax","s1","s2","user_key_limit"])
         if (f.has(k)) set[k] = f.get(k);
+      for (const k of ["endpoint_host","port","subnet","server_ip","server_ipv6","default_dns","default_mtu"])
+        set["auto_" + k] = f.get("auto_" + k) ? "1" : "0";
       set.amnezia_enabled = f.get("amnezia_enabled") ? 1 : 0;
       set.pfs = f.get("pfs") ? 1 : 0;
       try {
