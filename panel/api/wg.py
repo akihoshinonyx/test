@@ -8,7 +8,7 @@ import secrets
 import subprocess
 import time
 
-from db import conn, get_setting
+from db import conn, get_setting, set_setting
 
 CONF = "/etc/amnezia-panel/wg.conf"
 

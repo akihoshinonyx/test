@@ -69,6 +69,57 @@ def certbot_available():
     return None
 
 
+# ---------- startup self-healing ----------
+
+def _derive_server_pubkey():
+    """Ensure server private key + noise key exist and cache the public key.
+
+    Runs at boot: without a valid 'server_pubkey' setting every API call that
+    touches wg status (dashboard/keys) used to crash with NameError, which on
+    systemd-restart loops looked like a dead panel -> nginx 502 Bad Gateway.
+    """
+    try:
+        priv = wg.ensure_server_keys()
+        pub = wg.pubkey(priv)
+        db.set_setting("server_pubkey", pub)
+    except Exception as e:
+        sys.stderr.write("[warn] server_pubkey derivation failed: %s\n" % e)
+
+
+def _ensure_noise_key():
+    """Create /var/lib/amnezia-panel/noise.pem if missing (wg.conf references it)."""
+    path = "/var/lib/amnezia-panel/noise.pem"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write(wg.gen_psk() + "\n")
+            os.chmod(path, 0o600)
+    except Exception as e:
+        sys.stderr.write("[warn] noise key init failed: %s\n" % e)
+
+
+def _ensure_wg_interface_up():
+    """Bring wg0 up if it is down (idempotent; safe to call on every start)."""
+    try:
+        r = subprocess.run(["wg", "show"], capture_output=True, text=True, timeout=10)
+        if "wg0" in (r.stdout or ""):
+            return True
+    except Exception:
+        pass
+    try:
+        conf = "/etc/amnezia-panel/wg.conf"
+        if not os.path.exists(conf):
+            conf = "/etc/wireguard/wg0.conf"
+        if os.path.exists(conf):
+            subprocess.run(["wg-quick", "up", "wg0"], capture_output=True, timeout=30)
+            r = subprocess.run(["wg", "show"], capture_output=True, text=True, timeout=10)
+            return "wg0" in (r.stdout or "")
+    except Exception:
+        pass
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AmneziaPanel/3.0"
 
@@ -700,7 +751,19 @@ R = lambda p: re.compile(p)
 
 
 def api_ping(self):
-    self._send(200, json.dumps({"ok": True, "app": "amnezia-panel"}).encode())
+    # lightweight health report: helps diagnose 502 / half-installed states
+    pub = db.get_setting("server_pubkey") or ""
+    wg_up = False
+    try:
+        r = subprocess.run(["wg", "show"], capture_output=True, text=True, timeout=5)
+        wg_up = "wg0" in (r.stdout or "")
+    except Exception:
+        pass
+    self._send(200, json.dumps({
+        "ok": True, "app": "amnezia-panel",
+        "wg0": wg_up,
+        "pubkey_ready": bool(pub),
+    }).encode())
 
 
 ROUTES = [
@@ -742,6 +805,11 @@ def background_loop():
 
 
 def main():
+    # self-heal critical state before serving (pubkey cache, noise key, wg0)
+    _ensure_noise_key()
+    _derive_server_pubkey()
+    threading.Thread(target=_ensure_wg_interface_up, daemon=True).start()
+
     t = threading.Thread(target=background_loop, daemon=True)
     t.start()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)

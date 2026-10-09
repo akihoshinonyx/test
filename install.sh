@@ -374,17 +374,45 @@ con.executemany('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', li
 con.commit(); con.close()
 PYEOF
 
-systemctl enable --now amnezia-panel awg-stats.timer >/dev/null 2>&1
-sleep 1
-if ! systemctl is-active --quiet amnezia-panel; then
-  warn "Сервис панели не запустился — последние строки журнала:"
-  journalctl -u amnezia-panel -n 20 --no-pager || tail -n 20 /var/log/amnezia-install.log
-  die "Сервис amnezia-panel аварийный. Исправьте /opt/amnezia-panel/api/server.py и выполните: systemctl restart amnezia-panel"
+# ensure DB dir exists (panel service writes WAL files there)
+mkdir -p /var/lib/amnezia-panel
+
+systemctl enable amnezia-panel awg-stats.timer >/dev/null 2>&1
+systemctl restart amnezia-panel || true
+sleep 2
+
+# self-heal loop: if the panel keeps crashing, show the real traceback and retry
+PANEL_OK=0
+for _i in 1 2 3 4 5 6; do
+  if curl -fsS --max-time 5 http://127.0.0.1:8777/api/ping >/dev/null 2>&1; then
+    PANEL_OK=1
+    break
+  fi
+  sleep 2
+done
+if [[ $PANEL_OK == 0 ]]; then
+  warn "Панель не отвечает на http://127.0.0.1:8777/api/ping."
+  warn "Диагностика (последние ошибки сервиса):"
+  journalctl -u amnezia-panel -n 40 --no-pager 2>/dev/null | sed 's/^/   /'
+  # try to surface a Python traceback directly
+  TRC=$(timeout 10 /usr/bin/python3 /opt/amnezia-panel/api/server.py 2>&1 | grep -A 12 "Traceback" | head -n 25 || true)
+  [[ -n "$TRC" ]] && printf '%s\n' "$TRC" | sed 's/^/   /'
+  warn "Пробую запустить сервис ещё раз..."
+  systemctl restart amnezia-panel || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 2
+    if curl -fsS --max-time 5 http://127.0.0.1:8777/api/ping >/dev/null 2>&1; then
+      PANEL_OK=1
+      break
+    fi
+  done
 fi
-if curl -fsS --max-time 5 http://127.0.0.1:8777/api/ping >/dev/null 2>&1; then
+if [[ $PANEL_OK == 1 ]]; then
   say "API панели отвечает на 127.0.0.1:8777 ✔"
 else
-  warn "API панели не отвечает на /api/ping — проверьте: systemctl status amnezia-panel"
+  warn "!! ВНИМАНИЕ: панель не поднялась (nginx будет отдавать 502 Bad Gateway)."
+  warn "Строки выше содержат точную причину падения — исправьте её и выполните:"
+  echo "   systemctl restart amnezia-panel && journalctl -u amnezia-panel -f"
 fi
 
 # ---------------------------------------------------------------- 10. done
