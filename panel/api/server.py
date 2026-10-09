@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -22,6 +23,18 @@ WEB_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 PORT = int(os.environ.get("AWG_PORT", "8777"))
 
 db.init_db()
+db.sync_admin_login()
+
+
+def _fatal(msg):
+    """Print a loud diagnostic to stderr/journal and exit non-zero."""
+    sys.stderr.write("=" * 60 + "\n[FATAL] %s\n" % msg)
+    try:
+        with open("/var/log/amnezia-panel.log", "a") as f:
+            f.write("[FATAL] %s\n" % msg)
+    except OSError:
+        pass
+    sys.exit(1)
 
 
 # ---------------- helpers ----------------
@@ -556,6 +569,14 @@ class Handler(BaseHTTPRequestHandler):
         c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?", (h, s, u["id"]))
         c.commit()
         c.close()
+        if u["role"] == "admin":
+            # keep admin.json in sync so installer re-runs don't restore the old password
+            try:
+                with open(db.ADMIN_CRED_PATH, "w") as f:
+                    json.dump({"username": u["username"], "password": d["new_password"]}, f)
+                os.chmod(db.ADMIN_CRED_PATH, 0o600)
+            except OSError:
+                pass
         self.json_out({"ok": True})
 
     # ---------- settings / stats ----------
@@ -759,10 +780,13 @@ def api_ping(self):
         wg_up = "wg0" in (r.stdout or "")
     except Exception:
         pass
+    index_ok = os.path.isfile(os.path.join(WEB_ROOT, "index.html"))
     self._send(200, json.dumps({
         "ok": True, "app": "amnezia-panel",
         "wg0": wg_up,
         "pubkey_ready": bool(pub),
+        "web_root": WEB_ROOT,
+        "web_files_ok": index_ok,
     }).encode())
 
 
@@ -805,6 +829,15 @@ def background_loop():
 
 
 def main():
+    # fail loudly (journal + /var/log/amnezia-panel.log) if the install is broken
+    if not os.path.isfile(os.path.join(WEB_ROOT, "index.html")):
+        _fatal("web UI missing: %s/index.html not found — панель не была установлена "
+               "полностью. Перезапустите установку: bash install.sh" % WEB_ROOT)
+    try:
+        socket.getaddrinfo("127.0.0.1", PORT)
+    except Exception as e:
+        _fatal("bad AWG_PORT %r: %s" % (PORT, e))
+
     # self-heal critical state before serving (pubkey cache, noise key, wg0)
     _ensure_noise_key()
     _derive_server_pubkey()
@@ -812,7 +845,11 @@ def main():
 
     t = threading.Thread(target=background_loop, daemon=True)
     t.start()
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError as e:
+        _fatal("cannot bind 127.0.0.1:%d (%s) — возможно порт занят другим процессом; "
+               "проверьте: ss -ltnp | grep %d" % (PORT, e, PORT))
     print("AmneziaWG panel listening on 127.0.0.1:%d" % PORT)
     srv.serve_forever()
 

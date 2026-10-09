@@ -84,6 +84,9 @@ def pw_hash(password, salt=None):
     return h.hex(), salt
 
 
+ADMIN_CRED_PATH = "/etc/amnezia-panel/admin.json"
+
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     c = conn()
@@ -93,7 +96,7 @@ def init_db():
     if row["n"] == 0:
         import json
         try:
-            with open("/etc/amnezia-panel/admin.json") as f:
+            with open(ADMIN_CRED_PATH) as f:
                 a = json.load(f)
             uname, pwd = a["username"], a["password"]
         except Exception:
@@ -107,6 +110,50 @@ def init_db():
         )
     c.commit()
     c.close()
+
+
+def sync_admin_login():
+    """Keep the DB admin account in sync with /etc/amnezia-panel/admin.json.
+
+    The installer writes admin.json on every re-run; if the login was renamed
+    afterwards we must rename it in the DB too — otherwise the admin would be
+    locked out after reinstalling. Password changes happen only via the panel
+    API (/api/password), which also updates admin.json.
+
+    Exception: a *fresh* install (empty keys/users activity) may legitimately
+    reset the admin password via admin.json — apply it then, so that an
+    interrupted first install never leaves a stale unusable hash in the DB.
+    """
+    import json
+    try:
+        with open(ADMIN_CRED_PATH) as f:
+            a = json.load(f)
+        want_user = str(a.get("username") or "").strip().lower()
+        want_pass = str(a.get("password") or "")
+    except Exception:
+        return
+    c = conn()
+    try:
+        r = c.execute("SELECT id, username FROM users WHERE role='admin' "
+                      "ORDER BY id LIMIT 1").fetchone()
+        if not r:
+            return
+        if r["username"].lower() != want_user:
+            clash = c.execute("SELECT id FROM users WHERE username=? AND id<>?",
+                              (want_user, r["id"])).fetchone()
+            if not clash:
+                c.execute("UPDATE users SET username=? WHERE id=?",
+                          (want_user, r["id"]))
+        nkeys = c.execute("SELECT COUNT(*) n FROM keys").fetchone()["n"]
+        nuser = c.execute("SELECT COUNT(*) n FROM users WHERE role<>'admin'"
+                          ).fetchone()["n"]
+        if want_pass and nkeys == 0 and nuser == 0:
+            h, s = pw_hash(want_pass)
+            c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?",
+                      (h, s, r["id"]))
+        c.commit()
+    finally:
+        c.close()
 
 
 def _write_admin(u, p):

@@ -160,8 +160,32 @@ fi
 chmod 600 /var/lib/amnezia-panel/noise.pem
 
 # admin credentials consumed by db.init_db()
+if [[ -f /etc/amnezia-panel/admin.json ]]; then
+  OLD_ADMIN_USER=$(python3 -c "import json;print(json.load(open('/etc/amnezia-panel/admin.json'))['username'])" 2>/dev/null || echo "$ADMIN_USER")
+  OLD_ADMIN_PASS=$(python3 -c "import json;print(json.load(open('/etc/amnezia-panel/admin.json'))['password'])" 2>/dev/null || true)
+  if [[ -n "$OLD_ADMIN_PASS" && "$OLD_ADMIN_PASS" != "$ADMIN_PASS" ]]; then
+    # панель уже работала и пароль мог быть сменён через веб-интерфейс —
+    # сохраняем существующий, чтобы повторный запуск не «вернул» старый
+    ADMIN_USER="$OLD_ADMIN_USER"; ADMIN_PASS="$OLD_ADMIN_PASS"
+    say "Используются сохранённые учётные данные администратора ($ADMIN_USER)."
+  fi
+fi
 printf '{"username": "%s", "password": "%s"}' "$ADMIN_USER" "$ADMIN_PASS" > /etc/amnezia-panel/admin.json
 chmod 600 /etc/amnezia-panel/admin.json
+
+# если БД уже есть (повторная установка) — применяем актуальный логин сразу,
+# чтобы даже упавший сервис пускал вас по данным из админской консоли
+if [[ -f /var/lib/amnezia-panel/panel.db ]]; then
+  python3 - <<'PYEOF' || true
+import sys
+sys.path.insert(0, "/opt/amnezia-panel/api")
+try:
+    import db
+    db.sync_admin_login()
+except Exception as e:
+    print("[warn] sync_admin_login:", e)
+PYEOF
+fi
 
 # ---------------------------------------------------------------- 6. initial wg0 config
 say "Создание интерфейса wg0 (AmneziaWG, порт $WG_PORT)..."
@@ -407,6 +431,35 @@ else
   warn "!! ВНИМАНИЕ: панель не поднялась (nginx будет отдавать 502 Bad Gateway)."
   warn "Строки выше содержат точную причину падения — исправьте её и выполните:"
   echo "   systemctl restart amnezia-panel && journalctl -u amnezia-panel -f"
+fi
+
+# --- emergency admin access: if the panel is down, recover login/password from DB
+if [[ $PANEL_OK == 0 && -f /var/lib/amnezia-panel/panel.db ]]; then
+  say "Пробую восстановить доступ к панели напрямую через базу данных..."
+  python3 - <<'PYEOF' || true
+import json, os, sys
+sys.path.insert(0, "/opt/amnezia-panel/api")
+try:
+    import db
+    c = db.conn()
+    r = c.execute("SELECT id, username FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
+    if not r:
+        print("[warn] в БД нет администратора")
+        sys.exit(0)
+    new_pass = os.environ.get("ADMIN_PASS_RECOVER") or ""
+    if not new_pass:
+        import secrets as _s
+        new_pass = _s.token_urlsafe(12)[:14]
+    h, s = db.pw_hash(new_pass)
+    c.execute("UPDATE users SET pass_hash=?, salt=?, enabled=1 WHERE id=?", (h, s, r["id"]))
+    c.commit(); c.close()
+    with open(db.ADMIN_CRED_PATH, "w") as f:
+        json.dump({"username": r["username"], "password": new_pass}, f)
+    os.chmod(db.ADMIN_CRED_PATH, 0o600)
+    print("Логин восстановлен напрямую в БД: %s / %s" % (r["username"], new_pass))
+except Exception as e:
+    print("[warn] восстановление логина не удалось:", e)
+PYEOF
 fi
 
 # ---------------------------------------------------------------- 10. done
