@@ -61,6 +61,14 @@ SETTINGS_KEYS = [
 ]
 
 
+def certbot_available():
+    """Path to the certbot binary if it is installed on this system."""
+    for p in ("/usr/bin/certbot", "/usr/local/bin/certbot"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AmneziaPanel/3.0"
 
@@ -562,6 +570,127 @@ class Handler(BaseHTTPRequestHandler):
         ok, err = wg.apply_config()
         self.json_out({"ok": ok, "error": err if not ok else None})
 
+    # ---------- maintenance / uninstall (admin) ----------
+
+    PANEL_PATHS = [
+        "/opt/amnezia-panel",
+        "/etc/amnezia-panel",
+        "/var/lib/amnezia-panel",
+        "/var/log/amnezia-install.log",
+        "/etc/systemd/system/amnezia-panel.service",
+        "/etc/systemd/system/awg-stats.service",
+        "/etc/systemd/system/awg-stats.timer",
+        "/etc/nginx/sites-available/amnezia-panel",
+        "/etc/nginx/sites-enabled/amnezia-panel",
+        "/etc/wireguard/wg0.conf",
+        "/etc/sysctl.d/60-amnezia-panel.conf",
+    ]
+
+    def _run(self, cmd, timeout=30):
+        try:
+            p = subprocess.run(cmd, shell=True, capture_output=True,
+                               text=True, timeout=timeout)
+            return (p.stdout + p.stderr).strip()
+        except Exception as e:
+            return "error: %s" % e
+
+    def _service_exists(self, name):
+        return os.path.exists("/etc/systemd/system/%s" % name)
+
+    def api_maintenance_status(self):
+        self.require(admin=True)
+        domain = db.get_setting("endpoint_host", "")
+        cert_ok = bool(domain) and os.path.isfile(
+            "/etc/letsencrypt/live/%s/fullchain.pem" % domain)
+        out = []
+        for p in self.PANEL_PATHS:
+            if os.path.isdir(p):
+                out.append({"path": p, "type": "dir", "exists": True})
+            elif os.path.islink(p):
+                out.append({"path": p, "type": "symlink", "exists": True})
+            elif os.path.exists(p):
+                out.append({"path": p, "type": "file", "exists": True})
+            else:
+                out.append({"path": p, "type": "none", "exists": False})
+        services = {}
+        for svc in ("amnezia-panel.service", "awg-stats.service",
+                    "awg-stats.timer", "wg-quick@wg0.service"):
+            services[svc] = self._run(
+                "systemctl is-active %s 2>/dev/null" % svc, 10) or "unknown"
+        self.json_out({
+            "paths": out,
+            "services": services,
+            "certbot": certbot_available(),
+            "letsencrypt_cert": cert_ok,
+            "domain": domain,
+        })
+
+    def api_uninstall_preview(self):
+        self.require(admin=True)
+        self.json_out({"remove": self.PANEL_PATHS,
+                       "keep": ["/etc/letsencrypt (сертификаты)",
+                                "wg-quick (интерфейс wg0 — будет остановлен)",
+                                "Nginx / UFW / fail2ban (системные пакеты)"]})
+
+    def api_uninstall_run(self):
+        u = self.require(admin=True)
+        d = self.read_body()
+        if str(d.get("confirm", "")) != "DELETE-PANEL":
+            raise ValueError("Введите DELETE-PANEL для подтверждения удаления")
+        if int(d.get("user_id", -1)) != int(u["id"]):
+            raise PermissionError("Только текущий администратор может удалить панель")
+        # response first — the service will be stopped right after
+        self.json_out({"ok": True, "message":
+                       "Файлы панели удаляются. Сервис будет остановлен."})
+
+        script = r"""#!/bin/bash
+set +e
+LOG=/tmp/amnezia-uninstall.log
+exec >>"$LOG" 2>&1
+echo "=== AmneziaWG panel uninstall $(date) ==="
+# stop & disable panel services (this script itself runs under amnezia-panel.service)
+systemctl stop awg-stats.timer awg-stats.service 2>/dev/null
+systemctl disable --now amnezia-panel 2>/dev/null
+# drop the VPN interface but keep wireguard-tools installed
+wg-quick down wg0 2>/dev/null
+ip link set wg0 down 2>/dev/null; ip link del wg0 2>/dev/null
+# remove panel files
+rm -rf /opt/amnezia-panel /etc/amnezia-panel /var/lib/amnezia-panel
+rm -f /var/log/amnezia-install.log \
+      /etc/systemd/system/amnezia-panel.service \
+      /etc/systemd/system/awg-stats.service \
+      /etc/systemd/system/awg-stats.timer \
+      /etc/nginx/sites-available/amnezia-panel \
+      /etc/nginx/sites-enabled/amnezia-panel \
+      /etc/wireguard/wg0.conf \
+      /etc/sysctl.d/60-amnezia-panel.conf
+# revoke Let's Encrypt certificate for the panel domain (if any)
+DOM=$(grep -h '^server_name' /etc/nginx/conf.d/*.conf /etc/nginx/sites-available/* 2>/dev/null | awk '/[^ ]/{print $2; exit}')
+if command -v certbot >/dev/null 2>&1; then
+  for c in $(certbot certificates 2>/dev/null | awk '/Certificate Name:/{print $3}'); do
+    certbot delete --non-interactive --cert-name "$c" >/dev/null 2>&1
+  done
+fi
+systemctl daemon-reload
+systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null
+# clean up our crontab entry if present
+crontab -l 2>/dev/null | grep -v 'certbot renew --quiet --deploy-hook' | crontab - 2>/dev/null
+sync
+sleep 2
+rm -f /usr/local/sbin/amnezia-panel-uninstall.sh
+echo "uninstall finished"
+"""
+        path = "/usr/local/sbin/amnezia-panel-uninstall.sh"
+        try:
+            with open(path, "w") as f:
+                f.write(script)
+            os.chmod(path, 0o755)
+        except OSError as e:
+            return self.json_out({"ok": False, "error": str(e)}, 500)
+        subprocess.Popen(["setsid", "bash", path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
 
 def sanitize_user(u):
     return {"id": u["id"], "username": u["username"], "role": u["role"]}
@@ -590,6 +719,9 @@ ROUTES = [
     (R(r"^/api/settings$"), "GET", Handler.api_settings_get),
     (R(r"^/api/settings$"), "PUT", Handler.api_settings_put),
     (R(r"^/api/reload$"), "POST", Handler.api_reload),
+    (R(r"^/api/maintenance$"), "GET", Handler.api_maintenance_status),
+    (R(r"^/api/uninstall/preview$"), "GET", Handler.api_uninstall_preview),
+    (R(r"^/api/uninstall$"), "POST", Handler.api_uninstall_run),
 ]
 
 

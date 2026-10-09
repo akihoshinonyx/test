@@ -127,3 +127,10 @@ tr:hover td{background:rgba(99,102,241,.05)}
 .searchbar input{margin:0;max-width:280px}
 .empty{text-align:center;padding:50px 20px;color:var(--muted)}
 .empty .big{font-size:2.6rem;margin-bottom:10px}
+
+/* maintenance / danger zone */
+.danger-zone{border:1px solid rgba(248,113,113,.35);background:
+  linear-gradient(180deg,rgba(248,113,113,.06),transparent)}
+.danger-zone h3{color:var(--err)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
+.badge.warn{color:#fbbf24;border-color:rgba(251,191,36,.35)}

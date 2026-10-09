@@ -96,6 +96,7 @@ const NAV = [
   ["keys", "🔑", "Ключи VPN"],
   ["users", "👥", "Пользователи", "admin"],
   ["settings", "⚙️", "Настройки", "admin"],
+  ["maintenance", "🧰", "Обслуживание", "admin"],
 ];
 function renderNav(view) {
   $("#nav").innerHTML = NAV.filter(n => !n[3] || ME.role === n[3]).map(n =>
@@ -231,7 +232,69 @@ const VIEWS = {
       }
     };
   },
+
+  async maintenance() {
+    $("#main").innerHTML = `<h2 class="page">Обслуживание сервера</h2><div id="mnt" class="muted">Загрузка…</div>`;
+    const m = await api("/maintenance");
+    const svcBadge = s => {
+      const cls = s === "active" ? "ok" : (s === "unknown" || String(s).startsWith("error")) ? "off" : "off";
+      return `<span class="badge ${cls}"><i class="dot"></i>${esc(s)}</span>`;
+    };
+    $("#mnt").innerHTML = `
+    <div class="grid c2">
+      <div class="card"><h3 style="margin-top:0">🩺 Статус сервисов</h3>
+        <table>${Object.entries(m.services).map(([k, v]) =>
+          `<tr><td class="mono muted">${esc(k)}</td><td>${svcBadge(v)}</td></tr>`).join("")}
+          <tr><td class="muted">TLS-сертификат Let's Encrypt</td><td>${m.letsencrypt_cert
+            ? '<span class="badge ok"><i class="dot"></i>действует</span>'
+            : '<span class="badge warn"><i class="dot"></i>нет / самоподписанный</span>'}</td></tr>
+          <tr><td class="muted">Certbot</td><td>${m.certbot
+            ? '<span class="badge ok"><i class="dot"></i>установлен — автопродление включено</span>'
+            : '<span class="badge off"><i class="dot"></i>не найден</span>'}</td></tr>
+        </table>
+        <div class="row-actions" style="margin-top:14px">
+          <button class="btn" onclick="api('/reload',{method:'POST'}).then(()=>toast('Конфигурация wg0 применена ✔')).catch(e=>toast(e.message,'err'))">⇧ Применить конфиг WG</button>
+          <button class="btn" onclick="go('maintenance')">↻ Обновить</button>
+        </div>
+      </div>
+      <div class="card"><h3 style="margin-top:0">📁 Файлы панели</h3>
+        <table>${m.paths.map(p =>
+          `<tr><td class="mono muted" style="word-break:break-all">${esc(p.path)}</td><td>${p.exists
+            ? `<span class="badge off">${esc(p.type)}</span>` : '<span class="badge ok">отсутствует</span>'}</td></tr>`).join("")}
+        </table>
+      </div>
+    </div>
+    <div class="card danger-zone">
+      <h3 style="margin-top:0">☠️ Удаление веб-панели</h3>
+      <p class="muted small.muted">Полностью удалит файлы веб-панели с сервера: <b>/opt/amnezia-panel</b>, конфиги <b>/etc/amnezia-panel</b> и базу данных, systemd-сервисы, конфиг Nginx и сертификат Let's Encrypt домена <b>${esc(m.domain || "—")}</b>. VPN-интерфейс wg0 будет остановлен. Системные пакеты (nginx, wireguard-tools, ufw) останутся.</p>
+      <div class="row-actions">
+        <button class="btn danger" id="uninsBtn">🗑 Удалить панель с сервера…</button>
+      </div>
+    </div>`;
+    $("#uninsBtn").onclick = uninstallDialog;
+  },
 };
+
+async function uninstallDialog() {
+  const prev = await api("/uninstall/preview");
+  const r = await modal("☠️ Подтверждение удаления панели", `
+    <p class="muted">Будут <b>безвозвратно удалены</b>:</p>
+    <ul class="mono small.muted" style="margin:6px 0 12px 18px">${prev.remove.map(p => `<li>${esc(p)}</li>`).join("")}</ul>
+    <p class="muted">Останется нетронутым: ${prev.keep.map(esc).join("; ")}.</p>
+    <label style="margin-top:12px;color:#f87171">Введите <b>DELETE-PANEL</b> для подтверждения
+      <input name="confirm" autocomplete="off" placeholder="DELETE-PANEL" required></label>`,
+    d => runUninstall((d.confirm || "").trim()), "Удалить навсегда");
+  if (!r) return;
+}
+
+/* sends the uninstall request; server stops its own service right after answering */
+async function runUninstall(confirmText) {
+  if (confirmText !== "DELETE-PANEL") throw new Error("Текст подтверждения не совпадает");
+  const res = await api("/uninstall", { method: "POST", body: { confirm: confirmText, user_id: ME.id } });
+  toast(res.message || "Удаление запущено…", "ok");
+  setTimeout(() => { showLogin(); }, 3000);
+  return res;
+}
 
 /* ---------- key rendering ---------- */
 const TRANSPORT_LABEL = { wg: "WireGuard", "wg-amnezia": "AmneziaWG", shadowsocks: "SS+AmneziaWG" };
