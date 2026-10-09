@@ -51,6 +51,7 @@ fi
 PUB_IP=$(curl -fsS4 --max-time 10 https://ifconfig.me || curl -fsS4 --max-time 10 https://api.ipify.org || true)
 [[ -n "$PUB_IP" ]] || die "Не удалось определить публичный IP сервера."
 RESOLVED=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)
+[[ -n "$RESOLVED" ]] || RESOLVED=$(dig +short A "$DOMAIN" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)
 if [[ -n "$RESOLVED" && "$RESOLVED" != "$PUB_IP" ]]; then
   warn "Домен $DOMAIN резолвится на $RESOLVED, а сервер — $PUB_IP."
   warn "Let's Encrypt не выдаст сертификат, пока DNS не настроен. Продолжить? [y/N]"
@@ -69,7 +70,7 @@ say "Домен: $DOMAIN | IP: $PUB_IP | WG-порт: $WG_PORT | Админ: $AD
 
 # ---------------------------------------------------------------- 2. base packages
 say "Обновление списков пакетов и установка зависимостей..."
-apt-get update -qq
+apt-get update -qq || warn "apt update завершился с предупреждениями (некоторые репозитории недоступны) — продолжаем."
 apt-get install -y -qq apt-transport-https ca-certificates curl gnupg \
   wireguard-tools qrencode nginx python3 python3-pip openssl haveged unattended-upgrades \
   dnsutils >/dev/null 2>&1 || apt-get install -y wireguard-tools qrencode nginx python3 openssl
@@ -109,7 +110,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Locate panel sources: local repo layout (./panel) or fetch from GitHub if install.sh run standalone
 fetch_src() {
   local dest="$1" url="$2"
-  curl -fsSL --max-time 30 "$url" -o "$dest" || die "Не удалось скачать $url"
+  curl -fsSL --max-time 30 "$url" -o "$dest"     || curl -fsSL --max-time 30 "${url/raw.githubusercontent.com/fastly.jsdelivr.net/gh}" -o "$dest"     || die "Не удалось скачать $url"
 }
 if [[ -d "$SCRIPT_DIR/panel/api" && -d "$SCRIPT_DIR/panel/web" ]]; then
   SRC="$SCRIPT_DIR/panel"
