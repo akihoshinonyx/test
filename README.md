@@ -24,9 +24,9 @@
 
 ### Установщик `install.sh`
 1. Спрашивает **домен панели** (проверяет A-запись относительно публичного IP)
-2. Ставит все зависимости автоматически: wireguard-tools, nginx, python3, certbot, ufw, fail2ban, qrencode…
+2. Ставит все зависимости автоматически: wireguard-tools, nginx, python3, certbot, fail2ban, qrencode…
 3. Подключает репозиторий Amnezia и ставит модуль **AmneziaWG** (fallback на wireguard-dkms)
-4. Настраивает IP-форвардинг, NAT (MASQUERADE), iptables-persistent, UFW, fail2ban
+4. Настраивает IP-форвардинг, NAT (MASQUERADE), iptables-persistent, fail2ban (UFW не трогается — остаётся в исходном состоянии)
 5. Создаёт интерфейс `wg0`, systemd-сервисы панели и сбора статистики
 6. Автоматически выпускает **сертификат Let's Encrypt** для домена + автопродление
 7. Генерирует пароль администратора и печатает готовую сводку доступа
@@ -70,7 +70,7 @@ DOMAIN=vpn.example.com WG_PORT=443 ADMIN_USER=admin ADMIN_PASS='Свой_пар�
 - API слушает только `127.0.0.1`, наружу отдаётся через Nginx с TLS (Let's Encrypt)
 - RBAC: обычные пользователи видят только свои ключи
 - Приватные ключи сервера хранятся с chmod 600, конфиг `/etc/amnezia-panel/wg.conf` закрыт
-- Fail2ban + UFW включаются автоматически
+- Fail2ban включается автоматически; UFW установщик не трогает (файрвол остаётся выключенным, если был выключен)
 
 ## 🧹 Удаление панели
 
@@ -90,7 +90,7 @@ wg-quick down wg0; systemctl daemon-reload; systemctl reload nginx
 | Проблема | Решение |
 |---|---|
 | Certbot не выдал сертификат | Проверьте A-запись домена → IP сервера и открытые порты 80/443, затем: `certbot --nginx -d ваш-домен` |
-| Клиент не подключается | `wg show`, `ufw status` — порт UDP должен быть разрешён; проверьте `Jc/Jmin/Jmax` совпадают ли на клиенте |
+| Клиент не подключается | `wg show` — порт UDP ${WG_PORT} должен быть доступен извне (установщик не настраивает UFW; при необходимости откройте порты вручную или в панели безопасности хостинга); проверьте `Jc/Jmin/Jmax` совпадают ли на клиенте |
 | Забыт пароль админа | `sqlite3 /var/lib/amnezia-panel/panel.db "UPDATE users SET pass_hash='',salt='' WHERE username='admin'"` + перезапуск сервиса (или переустановка панели) |
 
 ## 📄 Лицензия

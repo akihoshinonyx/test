@@ -9,7 +9,7 @@
 #  What it does:
 #    1. Asks for panel domain (A record must point to this server)
 #    2. Installs AmneziaWG kernel module + wg tools (v3.0)
-#    3. Sets up NAT/forwarding, UFW firewall, fail2ban
+#    3. Sets up NAT/forwarding, fail2ban (UFW is NOT touched — stays as-is)
 #    4. Installs the web panel (Python, systemd) + Nginx
 #    5. Issues a Let's Encrypt certificate for the domain automatically
 #    6. Prints admin credentials and client connection info
@@ -196,15 +196,9 @@ netfilter-persistent save 2>/dev/null || iptables-save > /etc/iptables/rules.v4 
 systemctl enable --now wg-quick@wg0 >/dev/null 2>&1 || systemctl restart wg-quick@wg0
 
 # ---------------------------------------------------------------- 7. firewall
-say "Настройка UFW..."
-apt-get install -y -qq ufw >/dev/null 2>&1 || true
-ufw --force reset >/dev/null 2>&1
-ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null
-ufw allow 22/tcp comment SSH >/dev/null
-ufw allow 80/tcp comment HTTP >/dev/null
-ufw allow 443/tcp comment HTTPS >/dev/null
-ufw allow ${WG_PORT}/udp comment AmneziaWG >/dev/null
-ufw --force enable >/dev/null
+# UFW намеренно НЕ настраивается и НЕ включается этим установщиком:
+# если файрвол выключен — он остаётся выключенным, правила не трогаются.
+# При необходимости откройте порты вручную: 22/tcp, 80/tcp, 443/tcp, ${WG_PORT}/udp
 
 # fail2ban
 apt-get install -y -qq fail2ban >/dev/null 2>&1 && systemctl enable --now fail2ban >/dev/null 2>&1 || true
@@ -436,7 +430,7 @@ cat <<EOF
     systemctl status amnezia-panel   — статус панели
     systemctl status nginx           — статус веб-сервера
     wg show                          — активные пиры
-    ufw status                       — правила файрвола
+    systemctl status fail2ban        — защита от брутфорса
     tail -f /var/log/amnezia-install.log — лог установки
 
   ⚠️  Смените пароль администратора после первого входа!

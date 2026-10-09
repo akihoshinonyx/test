@@ -681,7 +681,7 @@ class Handler(BaseHTTPRequestHandler):
         self.json_out({"remove": self.PANEL_PATHS,
                        "keep": ["/etc/letsencrypt (сертификаты)",
                                 "wg-quick (интерфейс wg0 — будет остановлен)",
-                                "Nginx / UFW / fail2ban (системные пакеты)"]})
+                                "Nginx / fail2ban (системные пакеты)"]})
 
     def api_uninstall_run(self):
         u = self.require(admin=True)
