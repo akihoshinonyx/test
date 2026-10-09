@@ -1,0 +1,6 @@
+[Unit]
+Description=AmneziaWG panel stats sync
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -c "import sys;sys.path.insert(0,'/opt/amnezia-panel/api');import wg;wg.sync_stats()"

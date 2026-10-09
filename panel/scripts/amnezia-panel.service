@@ -1,0 +1,18 @@
+[Unit]
+Description=AmneziaWG Control Panel
+After=network.target wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/amnezia-panel/api/server.py
+Restart=always
+RestartSec=3
+Environment=AWG_PORT=8777
+DynamicUser=no
+User=root
+NoNewPrivileges=false
+ProtectSystem=off
+
+[Install]
+WantedBy=multi-user.target
