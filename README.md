@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/akihoshinonyx/test/main/install.sh 
 
 > Замените `akihoshinonyx/test` на ваш GitHub-репозиторий. Если клонируете руками:
 > ```bash
-> git clone https://github.com/akihoshinonyx/test.git && cd REPO && sudo bash install.sh
+> git clone https://github.com/akihoshinonyx/test.git && cd test && sudo bash install.sh
 > ```
 
 ### Непараметрическая (non-interactive) установка

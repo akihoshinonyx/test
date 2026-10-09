@@ -106,8 +106,25 @@ say "Установка файлов панели в /opt/amnezia-panel..."
 rm -rf /opt/amnezia-panel
 mkdir -p /opt/amnezia-panel /var/lib/amnezia-panel /etc/amnezia-panel
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -d "$SCRIPT_DIR/panel" ]]; then SRC="$SCRIPT_DIR/panel"; else SRC="$SCRIPT_DIR"; fi
+# Locate panel sources: local repo layout (./panel) or fetch from GitHub if install.sh run standalone
+fetch_src() {
+  local dest="$1" url="$2"
+  curl -fsSL --max-time 30 "$url" -o "$dest" || die "Не удалось скачать $url"
+}
+if [[ -d "$SCRIPT_DIR/panel/api" && -d "$SCRIPT_DIR/panel/web" ]]; then
+  SRC="$SCRIPT_DIR/panel"
+elif [[ -d "$SCRIPT_DIR/api" && -d "$SCRIPT_DIR/web" ]]; then
+  SRC="$SCRIPT_DIR"
+else
+  say "Файлы панели не найдены рядом со скриптом — скачиваю с GitHub..."
+  mkdir -p /tmp/amnezia-panel-src/api /tmp/amnezia-panel-src/web
+  BASE="https://raw.githubusercontent.com/akihoshinonyx/test/main"
+  for f in server.py db.py wg.py; do fetch_src "/tmp/amnezia-panel-src/api/$f" "$BASE/panel/api/$f"; done
+  for f in index.html app.js style.css; do fetch_src "/tmp/amnezia-panel-src/web/$f" "$BASE/panel/web/$f"; done
+  SRC="/tmp/amnezia-panel-src"
+fi
 cp -r "$SRC/api" "$SRC/web" /opt/amnezia-panel/
+rm -rf /tmp/amnezia-panel-src
 pip3 install --quiet qrcode pillow 2>/dev/null || pip3 install --break-system-packages --quiet qrcode pillow 2>/dev/null || warn "qrcode/pillow не установлены (QR будет недоступен)."
 
 # noise key for PFS (server-level preshared file used by wg-easy style configs)
