@@ -61,6 +61,12 @@ fi
 read -rp "$(echo -e "${C_B}Порт WireGuard/AmneziaWG (по умолчанию 443): ${C_0}")" WG_PORT
 WG_PORT=${WG_PORT:-443}
 ADMIN_USER=${ADMIN_USER:-admin}
+if [[ -z "${ADMIN_PASS:-}" && -f /etc/amnezia-panel/admin.json ]]; then
+  # re-install: keep previously generated credentials and WG keys
+  ADMIN_USER=$(python3 -c "import json;print(json.load(open('/etc/amnezia-panel/admin.json'))['username'])" 2>/dev/null || echo admin)
+  ADMIN_PASS=$(python3 -c "import json;print(json.load(open('/etc/amnezia-panel/admin.json'))['password'])" 2>/dev/null || true)
+  [[ -n "$ADMIN_PASS" ]] && warn "Повторная установка — сохранены прежние логин/пароль администратора ($ADMIN_USER)."
+fi
 if [[ -z "${ADMIN_PASS:-}" ]]; then
   ADMIN_PASS=$(openssl rand -base64 12 | tr -d '/+=' | head -c 14)
   warn "Сгенерирован пароль администратора: ${C_Y}$ADMIN_PASS${C_0} (сохраните его!)"
@@ -88,7 +94,11 @@ if ! apt-get update -qq 2>/dev/null; then
   apt-get update -qq || true
 fi
 apt-get install -y amnezia-wg 2>/dev/null || apt-get install -y wireguard-dkms wireguard-tools 2>/dev/null \
-  || warn "Модуль AmneziaWG через apt не установлен — попробуем встроенный в ядро."
+  || warn "Модуль AmneziaWG через apt не установлен — используется встроенный в ядро wireguard."
+if ! curl -fsS --max-time 8 -o /dev/null https://repo.amnezia.org/deb/dists/${REPO}/InRelease 2>/dev/null; then
+  rm -f /etc/apt/sources.list.d/amnezia.list
+  warn "Репозиторий repo.amnezia.org недоступен с этого сервера — отключён из apt (VPN работает на модуле ядра wireguard)."
+fi
 
 # make sure the module loads
 modprobe wireguard 2>/dev/null || modprobe amneziawg 2>/dev/null || true
@@ -106,6 +116,8 @@ sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/60-amnezia-panel.conf
 say "Установка файлов панели в /opt/amnezia-panel..."
 rm -rf /opt/amnezia-panel
 mkdir -p /opt/amnezia-panel /var/lib/amnezia-panel /etc/amnezia-panel
+[[ -f /etc/amnezia-panel/server_private.key ]] && cp -n /etc/amnezia-panel/server_private.key /tmp/.awg_keep_priv 2>/dev/null || true
+[[ -f /var/lib/amnezia-panel/noise.pem ]] && cp -n /var/lib/amnezia-panel/noise.pem /tmp/.awg_keep_noise 2>/dev/null || true
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Locate panel sources: local repo layout (./panel) or fetch from GitHub if install.sh run standalone
 fetch_src() {
@@ -133,9 +145,18 @@ rm -rf /tmp/amnezia-panel-src
 pip3 install --quiet qrcode pillow 2>/dev/null || pip3 install --break-system-packages --quiet qrcode pillow 2>/dev/null || warn "qrcode/pillow не установлены (QR будет недоступен)."
 
 # noise key for PFS (server-level preshared file used by wg-easy style configs)
-wg genkey | tee /etc/amnezia-panel/server_private.key | wg pubkey > /etc/amnezia-panel/server_public.key
+if [[ -s /tmp/.awg_keep_priv ]]; then
+  mv /tmp/.awg_keep_priv /etc/amnezia-panel/server_private.key
+  wg pubkey < /etc/amnezia-panel/server_private.key > /etc/amnezia-panel/server_public.key
+else
+  wg genkey | tee /etc/amnezia-panel/server_private.key | wg pubkey > /etc/amnezia-panel/server_public.key
+fi
 chmod 600 /etc/amnezia-panel/server_private.key
-head -c 32 /dev/urandom | base64 > /var/lib/amnezia-panel/noise.pem
+if [[ -s /tmp/.awg_keep_noise ]]; then
+  mv /tmp/.awg_keep_noise /var/lib/amnezia-panel/noise.pem
+else
+  head -c 32 /dev/urandom | base64 > /var/lib/amnezia-panel/noise.pem
+fi
 chmod 600 /var/lib/amnezia-panel/noise.pem
 
 # admin credentials consumed by db.init_db()
